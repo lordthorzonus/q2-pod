@@ -278,6 +278,70 @@ Every name-sorted library list (artists, album artists, composers, genres, album
 
 `load_localclass_list` (`0x51357c`) runs the class's query into `tools_pdeq_directory`, `deque_assign`s it to `*p_deque_showlist`, clears the staging deque and returns `deque_size(*p_deque_showlist)`, which its callers take as the row count (Playlists, `0xf00b`, and Baidu's `0xff26` fill their own deque and return its size). For `0xf003`–`0xf006` the query is `getAllAlbum`, `getAllArtist` (`GetAllAlbumArtist` when `g_artist_type == 1`), `getAllComposer` or `getAllGenre`, and each appends an Unknown row (id -1) whenever the list has any rows (`getAllArtist` `0x508034`: type 4, the "Unknown Artist" string), even when every song carries the tag. `ringnav_localclass` runs stock, and when that class's last row has id -1 it runs the query the row's press would run (`class_query`, shared with the [Queue menu](#queue-menu): `getMusicBySonger(NULL)` and its kin, `where songer=""`). With no song it `deque_pop_back`s the row and returns one less. Whether a song exists is all it asks, so `ringnav_localclass` sets `library_first` around that call and `library_query` ends the scoped query with `limit 1`: stock puts one record in the staging deque, not every song without the tag, and SQLite stops at that song. ponytail: `songtable` has no index on the tags, so SQLite still scans it up to the first such song, and all of it when every song has the tag. The Queue menu's query on the same row (`qm_query`) still takes every song. The staging deque is cleared again, as stock leaves it. Coverflow builds its own album list and drops an empty Unknown card the same way (`drop_unknown`), but its query has no limit. A list with no rows at all (no card, an empty library): `empty_toast`, from a 0 ms timer so the page that loads it is up, closes that page (`album_page` or `localclass_page` on top with `g_class_type` the list's class) once the window manager has marked it opened (its `stage` property `WINDOW_STAGE_OPENED`, set after the open animation; the close path reads the same at `0x69d218`) with `window_manager_close_window_force`, polling every `EMPTY_POLL_MS` until then or until it stops being on top, then toasts "No albums", "No artists", "No composers" or "No genres" (`msginfo_dialog`, 2 s) over the Library list. Stock opened the black page, and an empty Albums grid's Return then did nothing until a restart, though Hold Return: Home's `back_to_home` left it; where its `window_close` went was not found, so no Return reaches that page now. A page that is no longer on top, or is another, keeps the toast alone.
 
+Library category Unknown probes now append `LIMIT 1` to the stock detail SQL and disable name
+sorting. They retain its projection, tag predicates and music-only filter, so at most one song
+record is built. A failed query does not prove absence and must not remove the Unknown row.
+Coverflow's separate `drop_unknown` path is unchanged.
+
+The full Artists loader also keeps one deep-copied sorted query result below the stock loader,
+preserving its title and showlist handling. The key includes database, rewritten SQL (including
+Artist versus Album Artist), callback/arguments, sorting mode, the stock ASCII/pinyin selector and
+`library_gen`. Odd generations bypass caching, and a changed generation/key discards the copy.
+Empty/failed queries are not cached. Both a 4,096-row guard and a conservative 512 KiB storage
+estimate must pass; larger lists still use stock loading. This targets repeat opens, not the
+first query's grouping or comparison cost.
+
+Albums and Genres also retain completed, postprocessed category rows under a **shared 2 MiB**
+conservative budget, with at most two entries and an 8,192-row guard. Hits restore the stock
+navigation title, assign independent displayed rows and clear staging; no split/Unknown work is
+repeated. Library generation, ASCII/pinyin mode and artist-mode changes invalidate retained rows.
+Scanning, empty/error results, failed Unknown probes, allocation failure and over-budget results
+bypass retention. Least-recently-used entries are evicted before allocation when required; song
+lists, widgets, favorites and detail categories are not cached here. Artists remains separately
+bounded at 512 KiB.
+
+The three stock database-query sort calls are wrapped without substituting borrowed record
+strings or pre-normalizing titles: libcstl can invoke stock's owning `stSongInfo` copy callback
+(`0x5b3b1c`), which frees destination strings before allocating copies. V00Ji's temporary title
+arena violated that ownership contract and was withdrawn after an Artists reboot on hardware.
+The four comparator trim sites retain stock article handling; per-row key reuse remains disabled.
+The revised MIPS regression executes the real stock copy callback
+with strict string-allocation tracking, rather than simulating record movement with memcpy.
+
+The replacement reference-sort path (lists of 64–65,000 rows, supported name comparators and a
+complete staging range only) sorts a deque of integer references with **the original libcstl
+algorithm and stock comparator**. A separate row-pointer table supplies the comparator's records;
+no owning record or string is changed during comparison. The resulting permutation is applied
+with at most `n-1` swaps through the real stock owning-copy callback and one owning temporary row.
+That limits owning assignments to O(n), without a second full song-record list. Metadata storage
+has a conservative 1 MiB estimate/guard (about 569 KiB for 43,086 rows), and is freed before return.
+Indices are validated before any record is changed. Small/oversized lists, other comparators,
+subranges, scans, busy state and initial allocation failures use ordinary stock sorting.
+`test/reference_sort.py` runs the shipped MIPS libcstl under QEMU, checking exact ID/tie order,
+owning strings, all metadata and cleanup with two synthetic comparators. MIPS navigation tests
+also exercise the adapter with both actual firmware comparators and its real owning-copy routine.
+
+Cold Library Albums can share one rich grouping between stock name sorting and `split`. A cheap
+Unknown probe pinned to `q2pod_album_nocase` first preserves stock's untagged handling (a missing
+index disables the shortcut instead of scanning). For tagged names with one exact
+spelling, the rich rows synthesize the original name callback through a constant `select 1`; stock
+still sorts those names and builds its normal rows/Initial markers/Unknown placeholder. `split`
+then consumes the same rich rows rather than querying again. Case variants retain the original
+name query and reuse only the rich metadata, preserving stock case/tie ordering. Unknown albums,
+unrecognized SQL, failed queries, active scans and over-budget results use the original path.
+The prefetch is synchronous and generation-checked, limited to 8,192 rows and a conservative 2 MiB
+per-result estimate, then consumed or freed at the end of the class load. It is not another
+persistent cache. Other categories, artist scopes and full Coverflow keep their existing queries.
+
+The artist Coverflow **All albums** action queries up to 16 literal album names per batch through
+stock's unsorted full-song callback. Names are SQL-quoted and matched with `COLLATE NOCASE`;
+compilations retain other artists' tracks. The usual album identity filter and disc/track/path/CUE
+sort then concatenate albums in cover order. Batches fetch at most 513 songs: more than 512 is an
+overflow sentinel, never a playable partial result, and falls back to individual album queries.
+Oversized names and failed batch queries also fall back. This bounds extra batch storage on
+low-RAM devices; the accumulated playback queue retains its existing memory requirements.
+
+
 ## Shuffle
 
 `localmusic_page_init` (`0x535334`) destroys `scroll_view_localmusic`'s children and builds 11 rows (`0x535508`), each button named by its index; the shared row click (`0x53510c`) `atoi`s that name into a switch. Stock's rows, by index (`get_localmusic_showinfo`, `0x50bf30`), are Update Local Music, All Songs, Album, Artist, Genre, Hi-Res, My Fav, Frequent, Recent, Recently Added and Playlist. The hook runs stock through `stock_localmusic_trampoline`, appends its own rows in the same widgets and styles (`list_row`, also Display settings'; `library_into` adds stock's `list_into` chevron), then `widget_restack`s every row into one order: Shuffle; Artist, Album, All Songs, Genre, Era (see [Era](#era)), Playlist, Ratings (My Fav hidden after it, see [Ratings](#ratings)); Recently Added, Recent, Most Played, Frequent (hidden: Most Played lists the same from every listen), Hi-Res, Long Songs; the media rows; Upload Scrobbles; Update Local Music last. A page that doesn't hold exactly 11 rows is left as stock built it. The added buttons have no name, so stock's click never sees them. The Shuffle row carries the `local_shuffle` icon, a build-added copy of stock's 52 px `playset_playmode`, which iPod pre-sizes to 40 px for Settings, and opens `shuffle_page`, a runtime page (`page_list` and `page_row_detail`, as Most Played's). Its Shuffle Songs row runs `getAllMusic(3)` (`0x5079cc`, no title sort) through `staged`, scoped to music as the Library's Artists and Albums are (`MUSIC_WHERE`, see [Podcasts and Audiobooks](#podcasts-and-audiobooks)), saves shuffle with `config_playmode(2, 1)` (`0x4fe718`, as the play-mode setting does), clears advanced play (`playback_clear`, so stock Shuffle's keep-the-groups rule below doesn't rebuild group shuffle), and folder-plays the copy from `rand_below(n)` as Coverflow does with `toolsRandnum` (`0x5cc71c`). Shuffle Songs is one-shot: `playback_unshuffle` takes the stock mode it replaces (or the one an earlier Shuffle Songs still holds), and when the next other queue loads, `ringnav_load` applies it with `config_playmode` before stock does, ending the advanced shuffle; a mode choice in between (`ringnav_mode`) is kept instead, and a reboot mid-shuffle keeps Shuffle, as the mode is held in RAM only. Its Shuffle Albums and Shuffle Folders rows run `playback_groups(all, 0|1)`. Picks leave the page open for another, and a note under the rows says albums and folders take a moment to shuffle. A resume after reboot therefore reloads the last track's folder, not the library. An empty library shows "Update Local Music first". **Most Played** uses `local_frequentplay`, the icon of stock's Frequent; see [Play counts](#play-counts). **Upload Scrobbles** shows with an account set up; see [Scrobbling](#scrobbling). **Podcasts**, **Audiobooks**, **Photos**, **Books** and **Videos** show with their folders; see [Podcasts and Audiobooks](#podcasts-and-audiobooks), [Photos](#photos), [Books](#books) and [Videos](#videos).
@@ -1426,6 +1490,43 @@ A modal dialog (every toast, `msginfo_dialog`, and the confirms) runs its own lo
 **Display → Coverflow → Artist View** (`Q2POD ARTISTCF`, a `pod_rows` toggle, the sub-page's first row) set to Coverflow (the default, with no key) hands an artist's albums to Coverflow. `ringnav_artist_list` already copies the albums tab's list (class `0xff01`) and `coverflow_split`s it for the cover keys; the layout copy is filtered by album identity against the selected artist's songs (`getMusicByAlbumArtist` or `getMusicBySonger`, following `artist_type`), so another artist's same-named album cannot leak in. The unfiltered split stays available for the artwork keys. The filtered copy goes to a 0 ms timer, and when the tab loads on a top `artistinfo_page`, `coverflow_artist` opens `coverflow_page` over it with that list as `cf.albums` (the library's list kept aside in `cf.all_albums` and put back on close). Until then the artist page is veiled (`artist_cf_veil`): opacity 0 and its `anim_hint` cleared before its first paint, so the Artists list stays until Coverflow cuts in, as Home's card opens it, instead of the grid sliding in and showing for a frame; with the covers up, its opacity and slide come back for its own Return. In this mode (`cf.scoped`, `ARTIST_ALBUMS`) `CARDS` is 0 (no Sort or Refresh) for one album, else 1: **All albums**, last, with the placeholder art and no caption under its name. Centre on it runs `play_all`: each cover's `coverflow_album_tracks` (the cover's own album, disc then track order, as its track list) appended in the covers' order into one deque, played from its first song through `play_folder` as a library queue (`0xf001`, as Most Played's: `0xff10` resume would rebuild one album of the name), so Now Playing opens and the play mode and shuffle state go as for an album; a missing first file shows "Storage unavailable" instead. A Play/Pause hold on it opens nothing (`coverflow_album` is albums only). The List view (`text_albums`) has no card. Further, the stock list and its library generation are left alone, the last album isn't saved or restored, the fast-turn letter jump is off, and Return on the covers closes the artist page under them (`window_manager_close_window_force`, unanimated; its stock Return, `on_return_onclick`, is only `navigator_back`, its cleanup on `EVT_WINDOW_CLOSE`) before `navigator_back`, so it lands on the Artists list. The artist page that got Coverflow is remembered (`art_cf_win`), so should it come back some other way, the tab's reload leaves the stock grid. A Coverflow already open (the one a song was played from, under Now Playing's Go to Artist or Ratings' Albums, issue #73) is closed once the new page is up (`scoped_open`, both scoped openers), along with an artist page right under it (`artist_under`, as Return does), `closed` run on it at once and its later `EVT_DESTROY` ignored (its ctx is no longer `cf.page`), since the covers keep one page's state; ponytail: Return from Now Playing then skips it. An artist with no albums keeps the grid.
 
 Go to Album opens through the same `scoped_open` as a one-album page (`ALBUM_TRACKS`): `cf.albums` is a one-record copy of the song's record and the page goes straight to its tracks with no covers under them, so Return (`keyup`) closes it with `navigator_back` instead of showing covers. Playing a track is the covers' `play`, `play_folder` at `0xff10`, so Shuffle Songs' mode comes back as from any other load (`ringnav_load`).
+
+**Artist query scope and indexes.** `patch/library.h` defines the artist album-name candidate queries
+and three ordinary indexes: `q2pod_album_nocase` on `album COLLATE NOCASE`,
+`q2pod_artist_album` on `(songer COLLATE NOCASE, album COLLATE NOCASE)`, and
+`q2pod_albumartist_album` on `(albumsonger COLLATE NOCASE, album COLLATE NOCASE)`.
+`ringnav_read_artistype` attempts installation on boot, before browsing, in a transaction on a
+separate SQLite handle. It skips missing databases and active scans, remembers only successful
+installation for a stable `library_gen`, and retries on later artist-setting reads after a scan or
+failure. Existing indexes use `IF NOT EXISTS`; a locked/read-only database or failed DDL leaves
+navigation functional without the optimization. The first installation can add boot time and
+database space; subsequent inserts and tag updates maintain the indexes. No expression indexes,
+table migrations, or new SQLite APIs are required.
+
+Stock `albumsonger like <literal>` predicates become two indexable alternatives: a nonempty album
+artist matching the literal, or a missing/empty album artist whose song artist matches it. Complete
+single- or double-quoted literals, including doubled quotes, are consumed together. Extended LIKE
+operands (such as concatenation or `ESCAPE`) stay on the old fallback path. Other uses of
+`albumsonger` retain the existing `ifnull(nullif(albumsonger,''),songer)` fallback. `LIKE` case and
+wildcard semantics remain stock's, so leading-wildcard names can still require a scan.
+
+The artist page passes an album-name scope through `coverflow_split_scoped`,
+`coverflow_by_year`, and the delayed `coverflow_artist` music filter. Before grouping,
+each query restricts `album COLLATE NOCASE` to names found under the selected artist. Album Artist
+mode uses a `UNION` of indexed album-artist and fallback song-artist lookups. NULL album names are
+also retained for stock Unknown handling. This deliberately includes other artists' albums of the
+same name: artwork disambiguation, album IDs/ratings, and compilation-wide year aggregation remain
+consistent with the main Albums list. `artist_albums` still checks actual membership against the
+selected artist's songs before showing covers. Other library views retain their unscoped queries.
+Bounds failures retain the old metadata query, never truncated SQL; the query hook's bounded
+buffers allow the larger nested predicates.
+
+`test/library_queries.py` checks the shared SQL against a 40,000-track synthetic library, including
+NULL/empty tags, quoted and wildcard artist names, case, Unicode, same-named albums, compilations,
+disc folders and spoken-audio filtering. It verifies index usage and reduced SQLite VM work, not
+hardware latency. The C query assembly, scope handoff and transactional installation also have
+checks in `test/coverflow.py` and `test/patch.py`; those require the Linux build/test environment.
+
 
 Set to Grid, every tab load on a top `artistinfo_page` runs `artist_bar` first: if the hidden `view_navbar` is still hidden, it shows and enables it and moves `tab_control` down by the navbar's height, shrinking it by the same amount. `pages`' self layout and the fixed-height `list_view_album` lose those pixels too. Stock's page code builds the navbar's children (`s_img_mulsel`, `s_btn_singersong_navbar`) and runs multi-select (`g_navbar_status`); its open handler (`0x4b066c`) clears that state each time the page opens. Limit: multi-select is touch only. Nothing routes the hardware Return to stock's cancel, so a Return mid-selection is expected to leave the page (this is inferred, not traced); reopening the page starts clean.
 

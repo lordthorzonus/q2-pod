@@ -422,6 +422,8 @@ const char *widget_get_type(void *x) { return W(x)->type; }
 int widget_get_visible(void *x) { return W(x)->visible; }
 int tk_strcmp(const char *a, const char *b) { return strcmp(a ? a : "", b ? b : ""); }
 int navigator_back_to_home(void) { return 0; }
+static unsigned queued_n;
+static const char *queued_album[64];
 static int backs, force_closes, played_cls = -1, played_idx = -1;
 unsigned playback_loads; /* playback.c's: ringnav_load's count of queue loads */
 static void *force_closed; /* the last window closed unanimated */
@@ -440,6 +442,15 @@ int navigator_to_with_context(const char *n, const void *c) {
     if (!strcmp(n, "playing_page")) played_idx = nav_ctx.idx, played_cls = nav_ctx.cls, ++playback_loads; /* stock's load */
     nav_n = *(const unsigned *)nav_ctx.dq; /* the queue's deque, as below */
     memcpy(nav_queue, (const char *)nav_ctx.dq + sizeof(unsigned), sizeof nav_queue);
+    if (!strcmp(n, "playing_page")) {
+        const int *context = c;
+        void *rows = *(void *const *)c;
+        assert(context[1] >= 0 && (context[2] == 0xf001 || context[2] == 0xff10) && context[3] == 2);
+        queued_n = deque_size(rows);
+        assert(queued_n <= 64);
+        for (unsigned i = 0; i < queued_n; ++i)
+            queued_album[i] = *(const char **)((char *)deque_at(rows, i) + REC_ALBUM);
+    }
     return ++navs, 0;
 }
 /* slide_menu: square items as high as the menu, plus the spacer. */
@@ -640,6 +651,20 @@ int music_records(void *list, int discovery) {
 }
 int spoken(const char *path) { return path && spoken_path(path); } /* navigation.c's */
 static int unknown_queries;
+static unsigned batch_queries;
+static int batch_oversized;
+static char batch_scope[3072];
+void *library_album_batch(const char *scope, int *count) {
+    ++batch_queries;
+    snprintf(batch_scope, sizeof batch_scope, "%s", scope);
+    deque *d = _create_deque("stSongInfo");
+    deque_init(d);
+    /* A superset exercises Coverflow's own identity filtering; SQL membership is tested separately. */
+    for (int i = 0; i < albums; ++i)
+        if (!spoken_path(paths[i])) _deque_push_back(d, records[i]);
+    *count = batch_oversized ? 513 : d->n;
+    return d;
+}
 int getMusicByAlbum(const char *a) {
     deque *d = shim_dir;
     d->n = 0;
@@ -656,7 +681,8 @@ int getMusicByAlbum(const char *a) {
 /* The albums told apart (a record each), and Sort's ranking queries over that grouping in another
    order, here the test's own order by name; a row may differ in case from the stock one, as the
    grouping allows. */
-static const char *ranked[16], *rank_sql;
+static const char *ranked[16];
+static char rank_sql[3072], album_sql[3072];
 static char rank_rows[16][0x60];
 static int rank_year[16]; /* the Year query's year column, each ranked row's (split_row's REC_YEAR) */
 /* navigation.c's Year order: newest first (0) or oldest. */
@@ -684,8 +710,10 @@ int album_row(void *a, int n, char **v, char **c) {
 int toolsUpdateDbTable(const char *db, const char *sql) { return 1; } /* only a drop-flag scan writes */
 int toolsGetUserStop(void) { return 0; }
 int msg_counting(void) { return 0; }
+int stock_dbquery_trampoline(const char *db, const char *sql, void *row, int sort) { return -1; }
 int toolsQueryDbTable(const char *db, const char *sql, void *row, int sort) {
     assert(!strcmp(db, "/mnt/data/database.db") && !sort && strstr(sql, "group by album COLLATE NOCASE,ifnull(albumsonger"));
+    snprintf(album_sql, sizeof album_sql, "%s", sql);
     deque *d = shim_dir;
     d->n = 0;
     if (!strstr(sql, " order by ")) {
@@ -701,7 +729,7 @@ int toolsQueryDbTable(const char *db, const char *sql, void *row, int sort) {
         return (int)d->n;
     }
     assert(strstr(sql, "time_create") || strstr(sql, "year"));
-    rank_sql = sql;
+    snprintf(rank_sql, sizeof rank_sql, "%s", sql);
     /* each row's columns as text, as SQLite hands them: id, album, songer, the art track,
        albumsonger, and YEAR_SQL's year */
     int cols = strstr(sql, "else 0 end) from") ? 6 : 5;
@@ -1891,14 +1919,28 @@ static void sorting(void) {
     assert(queries == q); /* unchanged: kept */
     year_old = 0;
     /* An artist page's albums (coverflow_by_year), in place: the query's order, the rest after. */
-    extern void coverflow_by_year(void *);
+    extern void coverflow_by_year(void *, const char *);
     void *mine = _create_deque("stSongInfo");
     deque_init(mine);
     for (int i = 5; i < 8; ++i) _deque_push_back(mine, records[i]); /* A B C */
     ranked[0] = "C", ranked[1] = "New", ranked[2] = "a", ranked[3] = 0;
-    coverflow_by_year(mine);
+    coverflow_by_year(mine, 0);
     assert(deque_size(mine) == 3 && deque_at(mine, 0) == records[7] && deque_at(mine, 1) == records[5] &&
            deque_at(mine, 2) == records[6]);
+    extern int coverflow_split_scoped(void *, const char *);
+    const char *scope = "album COLLATE NOCASE in (select album from songtable where songer like 'Artist''s') or album is null";
+    coverflow_by_year(mine, scope);
+    assert(strstr(rank_sql, "from songtable where (album COLLATE NOCASE in (") &&
+           strstr(rank_sql, "songer like 'Artist''s') or album is null) group by") &&
+           strstr(rank_sql, "order by"));
+    coverflow_split_scoped(mine, scope);
+    assert(strstr(album_sql, "where (album COLLATE NOCASE in (") && !strstr(album_sql, "order by"));
+    char oversized[4096];
+    memset(oversized, 'x', sizeof oversized - 1), oversized[sizeof oversized - 1] = 0;
+    coverflow_by_year(mine, oversized); /* overflow retains the old query, never truncates */
+    assert(!strstr(rank_sql, " where ") && strstr(rank_sql, "order by"));
+    coverflow_by_year(mine, 0); /* an artist scope is never retained by subsequent calls */
+    assert(!strstr(rank_sql, " where ") && strstr(rank_sql, "order by"));
     deque_destroy(mine);
     /* Recently Added: the query's order (a name in another case still matches), the rest after. */
     ranked[0] = "C", ranked[1] = "a", ranked[2] = "New", ranked[3] = "COVER", ranked[4] = "Gone", ranked[5] = 0;
@@ -1935,7 +1977,7 @@ static void sorting(void) {
 
 /* Artist albums: Coverflow (navigation.c): an artist's albums alone, in their order, then All
    albums, no Sort or Refresh card; the library's list is back once the page closes. */
-int coverflow_artist(void *albums);
+int coverflow_artist(void *albums, const char *scope);
 static void artist_only(void) {
     rescan();
     open_page();
@@ -1944,7 +1986,8 @@ static void artist_only(void) {
     deque *d = _create_deque(0);
     d->at[d->n++] = records[6], d->at[d->n++] = records[8];
     page = &w[nw + 1];
-    assert(coverflow_artist(d));
+    assert(coverflow_artist(d, "album COLLATE NOCASE in ('B','Tight')"));
+    assert(strstr(album_sql, "where (album COLLATE NOCASE in ('B','Tight')) and fileurl not like"));
     run();
     assert(slide()->nkids == 3);
     order_is((const char *const[]){ "B", "Tight", 0 });
@@ -1962,10 +2005,23 @@ static void artist_only(void) {
         assert(glide_goal == end);
         glide_end(s);
     }
+    unsigned batches = batch_queries;
+    w[s->kids[2]].click(w[s->kids[2]].ctx, 0); run();
+    assert(batch_queries == batches + 1 && queued_n == 2);
+    assert(!strcmp(queued_album[0], "B") && !strcmp(queued_album[1], "Tight"));
+    assert(!strcmp(batch_scope, "album COLLATE NOCASE in ('B','Tight')"));
+    snprintf(names[6], sizeof names[6], "B's%%_");
+    w[s->kids[2]].click(w[s->kids[2]].ctx, 0); run();
+    assert(queued_n == 2 && !strcmp(batch_scope, "album COLLATE NOCASE in ('B''s%_','Tight')"));
+    snprintf(names[6], sizeof names[6], "B");
+    batch_oversized = 1;
+    w[s->kids[2]].click(w[s->kids[2]].ctx, 0); run();
+    assert(queued_n == 2 && !strcmp(queued_album[0], "B") && !strcmp(queued_album[1], "Tight"));
+    batch_oversized = 0;
     deque *again = _create_deque(0);
     again->at[again->n++] = records[0];
     page = &w[nw + 1];
-    assert(coverflow_artist(again)); /* a scoped page replaces the open one (#73) and owns the list */
+    assert(coverflow_artist(again, 0)); /* a scoped page replaces the open one (#73) and owns the list */
     run();
     order_is((const char *const[]){ "Cover", 0 });
     close_page();
@@ -1973,8 +2029,12 @@ static void artist_only(void) {
     assert(slide()->nkids == all);
     order_is((const char *const[]){ "Cover", "Folder", 0 });
     close_page();
+    rescan(); /* a fresh full-library load after an artist view must also remain unscoped */
+    open_page();
+    assert(slide()->nkids == all && !strstr(album_sql, "songer like") && !strstr(album_sql, " in ("));
+    close_page();
     deque *none = _create_deque(0);
-    assert(!coverflow_artist(none));
+    assert(!coverflow_artist(none, 0));
     free(none);
     assert(loads == unloads);
     artist_view = 2;
@@ -1982,7 +2042,7 @@ static void artist_only(void) {
     d->at[d->n++] = records[6], d->at[d->n++] = records[8];
     page = &w[nw + 1];
     int before = loads;
-    assert(coverflow_artist(d));
+    assert(coverflow_artist(d, 0));
     run();
     assert(loads == before); /* text mode never decodes artwork */
     widget *row = 0;
@@ -2086,7 +2146,7 @@ static void audiobooks(void) {
     deque *artist = _create_deque(0);
     artist->at[artist->n++] = records[music + 1];
     artist->at[artist->n++] = records[music + 4];
-    assert(!coverflow_artist(artist) && artist->n == 2);
+    assert(!coverflow_artist(artist, 0) && artist->n == 2);
     free(artist);
     assert(coverflow_rated(five_hearts));
     run();
@@ -2666,7 +2726,7 @@ static void thumb_wheel(void) {
     deque *d = _create_deque(0);
     d->at[d->n++] = records[6], d->at[d->n++] = records[8];
     page = &w[nw + 1];
-    assert(coverflow_artist(d));
+    assert(coverflow_artist(d, 0));
     run();
     s = slide(), top_window = page;
     index = (int *)(s->raw + SLIDE_INDEX), n = s->nkids;
@@ -4050,7 +4110,7 @@ static void arch(void) {
 /* ---- Pages, the scoped pages' cards, Go to Album, the build's Cancel row. ---- */
 extern int coverflow_turning(void), coverflow_rated(int (*)(void *)), coverflow_goto_album(void *), coverflow_shows_album(void *);
 extern void *coverflow_tracks(void *);
-extern void coverflow_by_year(void *);
+extern void coverflow_by_year(void *, const char *);
 static int under(const widget *x, const widget *a) {
     for (; x->parent; x = &w[x->parent])
         if (&w[x->parent] == a) return 1;
@@ -4212,7 +4272,7 @@ static void scoped_pages(void) {
     deque *d = _create_deque(0);
     d->at[d->n++] = records[6], d->at[d->n++] = records[8];
     page = &w[nw + 1];
-    assert(coverflow_artist(d));
+    assert(coverflow_artist(d, 0));
     run();
     widget *s = slide(), *cv = &w[s->parent];
     assert(s->nkids == 3);
@@ -4273,10 +4333,10 @@ static void scoped_pages(void) {
     _deque_push_back(mine, records[5]), _deque_push_back(mine, records[7]);
     ranked[0] = "C", ranked[1] = 0;
     calloc_fail = 1;
-    coverflow_by_year(mine);
+    coverflow_by_year(mine, 0);
     calloc_fail = 0;
     assert(deque_at(mine, 0) == records[5] && deque_at(mine, 1) == records[7]);
-    coverflow_by_year(mine);
+    coverflow_by_year(mine, 0);
     assert(deque_at(mine, 0) == records[7] && deque_at(mine, 1) == records[5]);
     ranked[0] = 0;
     free(mine);

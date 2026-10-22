@@ -471,6 +471,7 @@ class Machine:
             t=re.match(r'\s*[-+]?\d+',self.text(a)); ret=max(-2**31,min(2**31-1,int(t[0]))) if t else 0
             if b: self.word(b,a+(len(t[0]) if t else 0))
         elif name=='strstr@GLIBC_2.0': i=self.text(a).find(self.text(b)); ret=a+i if i>=0 else 0
+        elif name=='strncmp@GLIBC_2.0': x,y=self.text(a)[:c],self.text(b)[:c]; ret=(x>y)-(x<y)
         elif name=='strcasestr@GLIBC_2.2': i=self.raw(a).lower().find(self.raw(b).lower()); ret=a+i if i>=0 else 0
         elif name=='bitmap_get_line_length': ret=self.get(a+8)
         elif name=='bitmap_lock_buffer_for_write': ret=self.get(a+0x14)  # a test bitmap keeps its pixels' address there
@@ -5134,14 +5135,16 @@ for boot,want in ((lambda k:classic_light_boot(k,'1'),''),(lambda k:classic_ligh
     assert m.formats==(['Unknown Artist']*2 if want else []),m.formats
 passed()
 # Library sorts: both stock name comparators, on the patched trim calls, skip a leading article.
-from build import SORT_TRIMS
-for a in SORT_TRIMS: assert struct.unpack_from('<I',demo,fileoff(demo,a))[0]==jal(payload_syms['ringnav_sort_key'])
+from build import SORT_TRIMS, NAME_SORT_CALLS
+for a in SORT_TRIMS:
+    assert struct.unpack_from('<I',demo,fileoff(demo,a))[0]==jal(payload_syms['ringnav_sort_key'])
+for a in NAME_SORT_CALLS: assert struct.unpack_from('<I',demo,fileoff(demo,a))[0]==jal(payload_syms['ringnav_name_sort'])
 class SortMachine(Machine):
     def __init__(self):
         super().__init__(); self.handlers.pop(syms['toolsTrimLeft']); self.mock('strlen@GLIBC_2.0','snprintf@GLIBC_2.0')
         for n in ('__ctype_b_loc@GLIBC_2.3','__ctype_tolower_loc@GLIBC_2.3','strncmp@GLIBC_2.0','atoi@GLIBC_2.0',
                   'strcasecmp@GLIBC_2.0','strcmp@GLIBC_2.0','strncpy@GLIBC_2.0'): self.handlers[syms[n]]='s:'+n
-        b=self.alloc(0x400); t=self.alloc(0x400)  # glibc's tables from -128: the digit class, ASCII lowercase
+        b=self.alloc(0x400); t=self.alloc(0x600)  # 384 lowercase entries (-128..255), four bytes each
         for c in range(-128,256):
             self.u.mem_write(b+256+2*c,struct.pack('<H',0x800*(48<=c<58)))
             self.word(t+512+4*c,ord(chr(c).lower()) if 0<=c<128 else c)
@@ -5171,6 +5174,118 @@ for cmp in (0x5cd188,0x5cc870):
     passed()
 key=lambda t: (m.u.mem_write(0x1100000,t.encode()+b'\0'), m.call(address=payload_syms['ringnav_sort_key'],args=(0x1100000,0,0,0),gap=0), m.text(0x1100000))[2]
 assert [key(t) for t in ('  The Cure','THE CURE','The ','The  Cure','A','An ','Ant','周杰伦','The 周杰伦')]==['Cure','CURE','The ','The  Cure','A','An ','Ant','周杰伦','周杰伦']; passed()
+# Stock sorting OWNS record strings. Use the real MIPS stSongInfo copy callback rather than raw
+# byte moves: it frees destination strings and allocates copies. V00Ji's arena titles fail the
+# strict allocator below. Only the outer sort/iterator machinery remains mocked here.
+class PreparedNameMachine(SortMachine,QueueMachine):
+    def __init__(self):
+        self.live_strings=set()
+        super().__init__(); self.preparations=0; self.sorted_keys=[]; self.forwarded=[]
+        self.handlers[syms['algo_sort_if']]='prepared:sort'
+        self.word(0xa2638c,0x1000010); self.handlers[0x1000010]='prepared:free'
+        self.word(0xa26cc0-0xabc,0x1000014)
+        self.handlers.pop(0x5c65ac,None)  # execute owning assignment even when exposed as song_record_copy
+    def string(self,s):
+        p=super().string(s); self.live_strings.add(p); return p
+    def hook(self,u,address,size,unused):
+        if address==payload_syms['ringnav_sort_key']: self.preparations+=1
+        name=self.handlers.get(address,'')
+        if name=='prepared:free':
+            p=u.reg_read(REGS[0])
+            assert not p or p in self.live_strings, f'invalid/interior string free: {p:#x}'
+            self.live_strings.discard(p); self.returns(0); return
+        if address==0x1000014 or name=='q:calloc@GLIBC_2.0':
+            a,b=[u.reg_read(r) for r in REGS[:2]]
+            p=self.alloc(((a if address==0x1000014 else a*b)+7)&~3)
+            self.live_strings.add(p); self.returns(p); return
+        if address==syms['strcpy@GLIBC_2.0']:
+            a,b=[u.reg_read(r) for r in REGS[:2]]
+            u.mem_write(a,self.raw(b)+b'\0'); self.returns(a); return
+        if name!='prepared:sort': return super().hook(u,address,size,unused)
+        sp=u.reg_read(UC_MIPS_REG_SP)
+        words=[u.reg_read(r) for r in REGS]+[self.get(sp+16+4*i) for i in range(11)]
+        assert words[:14]==list(range(101,108))+list(range(201,208)),words
+        self.forwarded.append(words)
+        dq=self.get(syms['tools_pdeq_directory']); rows=self.items(dq)
+        self.sorted_keys=[self.text(self.get(r+O['REC_TITLE'])) if self.get(r+O['REC_TITLE']) else None for r in rows]
+        compare=words[14]; out=self.alloc(4)
+        def less(x,y):
+            self.nested(compare,x,y,out); return self.get(out)
+        order=sorted(rows,key=cmp_to_key(lambda x,y:-1 if less(x,y) else 1 if less(y,x) else 0))
+        size=self.alloc(4); self.word(size,0x58)
+        moved=[]
+        for source in order:
+            copy=self.alloc(0x60)
+            self.nested(0x5c65ac,copy,source,size)  # real stock deep copy, not Python memcpy
+            moved.append(copy)
+        for destination,source in zip(rows,moved): self.nested(0x5c65ac,destination,source,size)
+        self.returns(0)
+    def sort_names(self,compare):
+        return self.call(address=payload_syms['ringnav_name_sort'],args=tuple(range(101,105)),
+                         stack=(*range(105,108),*range(201,208),compare),gap=0,count=5_000_000)
+corpus=['The Cure','Coldplay','  An Orchestra','Disc 2','Disc 10','The','The ', '', 'The  Cure','Éclair','Björk']
+for compare in (0x5cc870,0x5cd188):
+    sm=PreparedNameMachine()
+    rows=[sm.song(name) for name in corpus]
+    for r,name in zip(rows,corpus): sm.word(r+O['REC_TITLE'],sm.string(name))
+    sm.deqs[sm.get(syms['tools_pdeq_directory'])][1]=rows
+    sm.sort_names(compare)
+    assert all(sm.text(sm.get(r+O['REC_TITLE']))==sm.text(sm.get(r+O['REC_NAME'])) for r in rows)
+    assert len(sm.forwarded)==1 and sm.sorted_keys[:3]==corpus[:3]
+    assert sm.preparations>len(corpus)  # comparator-copy normalization, never record substitution
+    assert sm.names(sm.get(syms['tools_pdeq_directory']))==ordered(corpus,compare)
+passed()
+# Combine the fast path with the actual stock language/numeric comparators and owning copy.
+# The separate QEMU test uses real libcstl; this model isolates the original firmware callbacks.
+class ReferenceNameMachine(PreparedNameMachine):
+    def __init__(self):
+        super().__init__(); self.zero=self.alloc(0x60); self.fast_calls=0
+    def marker(self,dq,end=False): return (len(self.items(dq)) if end else 0,0,0,0,dq,0,0)
+    def copy(self,kind,e):
+        if kind!='int' and getattr(self,'running',False):
+            p=self.alloc(0x60); ok=self.alloc(4); self.nested(0x5c65ac,p,e,ok); return p
+        return super().copy(kind,e)
+    def hook(self,u,address,size,unused):
+        if address in (syms['deque_begin'],syms['deque_end']):
+            out,dq=[u.reg_read(r) for r in REGS[:2]]
+            u.mem_write(out,struct.pack('<7I',*self.marker(dq,address==syms['deque_end'])))
+            self.returns(out); return
+        name=self.handlers.get(address,'')
+        if name=='q:deque_destroy' and self.deqs[u.reg_read(REGS[0])][0]=='stSongInfo':
+            ok=self.alloc(4)
+            for r in self.items(u.reg_read(REGS[0])): self.nested(0x5c65ac,r,self.zero,ok)
+        if name!='prepared:sort': return super().hook(u,address,size,unused)
+        sp=u.reg_read(UC_MIPS_REG_SP)
+        words=[u.reg_read(r) for r in REGS]+[self.get(sp+16+4*i) for i in range(11)]
+        dq=words[4]; kind,rows=self.deqs[dq]; compare=words[14]; out=self.alloc(4)
+        def less(x,y): self.nested(compare,x,y,out); return self.get(out)
+        order=sorted(rows,key=cmp_to_key(lambda x,y:-1 if less(x,y) else 1 if less(y,x) else 0))
+        if kind=='int':
+            self.fast_calls+=1; self.deqs[dq][1]=order
+        else:
+            ok=self.alloc(4)
+            moved=[self.copy('stSongInfo',r) for r in order]
+            for a,b in zip(rows,moved): self.nested(0x5c65ac,a,b,ok)
+            for r in moved: self.nested(0x5c65ac,r,self.zero,ok)
+        self.returns(0)
+    def sort_references(self,compare):
+        dq=self.get(syms['tools_pdeq_directory']); words=(*self.marker(dq),*self.marker(dq,True),compare)
+        self.running=True
+        self.call(address=payload_syms['ringnav_name_sort'],args=words[:4],stack=words[4:],gap=0,count=20_000_000)
+        return [(self.get(r+O['REC_ID']),self.text(self.get(r+O['REC_TITLE']))) for r in self.items(dq)]
+for compare in (0x5cc870,0x5cd188):
+    answers=[]
+    for scanning in (0,1):
+        rm=ReferenceNameMachine()
+        rows=[rm.song(corpus[(i*37)%len(corpus)]) for i in range(128)]
+        for i,r in enumerate(rows):
+            rm.word(r+O['REC_TITLE'],rm.string(corpus[(i*37)%len(corpus)])); rm.word(r+O['REC_ID'],i)
+        rm.deqs[rm.get(syms['tools_pdeq_directory'])][1]=rows
+        rm.word(payload_syms['library_gen'],scanning)
+        answers.append(rm.sort_references(compare))
+        assert rm.fast_calls==(not scanning)
+    assert answers[0]==answers[1],(compare,answers)
+passed()
 # iPod boots to Home: home_page_init's memory-play resume, run from its stock context build, starts
 # the restored queue paused (mode 3) through player_start as playing_page_init would, and opens no
 # page; a 0xff class starts nothing, as the page's init. Car mode (mode 2) opens Now Playing as stock.
@@ -5462,9 +5577,129 @@ assert m.names(m.get(syms['p_deque_showlist']))==['Baroness','STP','Row 1']; pas
 # Run the actual Library query wrapper against SQLite, with mixed music/book/podcast tags and Unknowns.
 # The flag is scoped by ringnav_localclass above; outside it (Coverflow, folders, Podcasts) SQL stays intact.
 class QueryDone(Exception): pass
+album_class_machine=m  # later artwork regressions continue the split-album fixture above
+class CategoryCacheMachine(ClassMachine):
+    def __init__(self,**kw):
+        super().__init__(**kw); self.loads=0; self.titles=[]
+    def hook(self,u,address,size,unused):
+        if address==syms['music_nagvation_title']:
+            self.titles.append(u.reg_read(REGS[0])); self.returns(0); return
+        if address==syms['_create_deque'] and getattr(self,'fail_create',False):
+            self.returns(0); return
+        if address==self.tramp:
+            self.loads+=1
+            if getattr(self,'failed',False): self.returns(-1); return
+        super().hook(u,address,size,unused)
+        if address==self.tramp and getattr(self,'changed_during_load',False):
+            self.word(payload_syms['library_gen'],self.get(payload_syms['library_gen'])+2)
+        if self.handlers.get(address)=='q:getMusicByGenre' and getattr(self,'probe_failed',False):
+            self.returns(-1)
+    def load(self,cls=0xf006):
+        return signed(self.call(address=HOOKS['load_localclass_list'][0],args=(cls,0,0,0),gap=0))
+for cls in (0xf003,0xf006):
+    cm=CategoryCacheMachine(rows=2)
+    assert cm.load(cls)==2 and cm.loads==1
+    expected=cm.names(cm.get(syms['p_deque_showlist']))
+    cm.word(cm.row(0)+O['REC_NAME'],cm.string('Changed displayed copy'))
+    cm.deqs[cm.get(syms['tools_pdeq_directory'])][1]=[cm.song('Staging')]
+    assert cm.load(cls)==2 and cm.loads==1 and cm.names(cm.get(syms['p_deque_showlist']))==expected
+    assert cm.titles==[cls] and not cm.items(cm.get(syms['tools_pdeq_directory']))
+    for change in (lambda:cm.word(payload_syms['library_gen'],2),
+                   lambda:cm.u.mem_write(O['SORT_NAME_MODE'],b'\x01'),
+                   lambda:cm.word(syms['artist_type'],1)):
+        before=cm.loads; change(); assert cm.load(cls)==2 and cm.loads==before+1
+        assert cm.load(cls)==2 and cm.loads==before+1
+    cm.word(payload_syms['library_gen'],3)
+    before=cm.loads
+    assert cm.load(cls)==2 and cm.load(cls)==2 and cm.loads==before+2
+cm=CategoryCacheMachine(rows=2)
+assert cm.load(0xf003)==2 and cm.load(0xf006)==2 and cm.loads==2
+assert cm.load(0xf003)==2 and cm.load(0xf006)==2 and cm.loads==2  # both fit together
+cm=CategoryCacheMachine(rows=2)
+long_name=cm.string('x'*300000)
+for i in range(2):
+    for field in ('REC_NAME','REC_TITLE'): cm.word(cm.row(i)+O[field],long_name)
+assert cm.load(0xf006)==2 and cm.load(0xf003)==2 and cm.loads==2
+assert cm.load(0xf003)==2 and cm.loads==2
+assert cm.load(0xf006)==2 and cm.loads==3  # shared budget evicted the older Genres entry
+cm=CategoryCacheMachine(rows=2)
+long_name=cm.string('x'*600000)
+for i in range(2):
+    for field in ('REC_NAME','REC_TITLE'): cm.word(cm.row(i)+O[field],long_name)
+assert cm.load()==2 and cm.load()==2 and cm.loads==2  # over-budget bypass
+for attr,rows,want in (('fail_create',2,2),('failed',2,-1),('failed',0,-1)):
+    cm=CategoryCacheMachine(rows=rows); setattr(cm,attr,True)
+    assert cm.load()==want and cm.load()==want and cm.loads==2
+cm=CategoryCacheMachine(rows=0)
+assert cm.load()==0 and cm.load()==0 and cm.loads==2
+cm=CategoryCacheMachine(rows=2); cm.changed_during_load=True
+assert cm.load()==2 and cm.load()==2 and cm.loads==2
+cm=CategoryCacheMachine(rows=2); cm.probe_failed=True
+cm.word(cm.row(1)+O['REC_ID'],-1)
+assert cm.load()==2 and cm.load()==2 and cm.loads==2  # Unknown query failure is retried
+passed()
+class ArtistCacheMachine(QueueMachine):
+    tramp=int(manifest['patch_symbols']['stock_dbquery_trampoline'],16)
+    def __init__(self):
+        super().__init__(); self.executed=0; self.result=2
+        self.handlers.pop(syms['toolsQueryDbTable'],None)  # execute the patched wrapper, not Machine's DB stub
+        self.word(0xa2638c,0x1000010)
+        self.mock('strdup@GLIBC_2.0','strstr@GLIBC_2.0','strncmp@GLIBC_2.0')
+        self.handlers[0x1000010]='cache_free'
+        self.word(payload_syms['library_artists'],1)
+        self.dbname=self.string('/mnt/data/database.db')
+        self.sqlname=self.string('select id,songer from songtable group by songer COLLATE NOCASE')
+    def hook(self,u,address,size,unused):
+        if address==0x1000010: self.returns(0); return
+        if address==syms['_create_deque'] and getattr(self,'fail_create',False):
+            self.returns(0); return
+        if address==syms['strdup@GLIBC_2.0']:
+            self.returns(0 if getattr(self,'fail_strdup',False) else self.string(self.text(u.reg_read(REGS[0])))); return
+        if address!=self.tramp: return super().hook(u,address,size,unused)
+        self.executed+=1
+        self.deqs[self.get(syms['tools_pdeq_directory'])][1]=[self.copy('stSongInfo',r) for r in self.found[:max(0,self.result)]]
+        self.returns(self.result)
+    def query_artists(self,sql=None,sort=1,callback=123):
+        return self.call(address=HOOKS['toolsQueryDbTable'][0],
+                         args=(self.dbname,sql or self.sqlname,callback,sort),gap=0)
+m=ArtistCacheMachine()
+assert m.query_artists()==2 and m.executed==1
+directory=m.get(syms['tools_pdeq_directory']); original=m.names(directory)
+m.word(m.items(directory)[0]+O['REC_NAME'],m.string('Changed displayed copy'))
+cached_result=m.query_artists()
+assert cached_result==2 and m.executed==1 and m.names(directory)==original, (cached_result,m.executed,m.names(directory),original)
+for change in (lambda:m.word(payload_syms['library_gen'],2),
+               lambda:m.u.mem_write(O['SORT_NAME_MODE'],b'\x01'),
+               lambda:setattr(m,'sqlname',m.string('select id,albumsonger from songtable group by albumsonger COLLATE NOCASE'))):
+    before=m.executed; change(); assert m.query_artists()==2 and m.executed==before+1
+    assert m.query_artists()==2 and m.executed==before+1
+before=m.executed
+assert m.query_artists(sort=0)==2 and m.executed==before+1
+assert m.query_artists(callback=124)==2 and m.executed==before+2
+m.word(payload_syms['library_gen'],3)
+before=m.executed
+assert m.query_artists()==2 and m.query_artists()==2 and m.executed==before+2
+m.word(payload_syms['library_gen'],4)
+for result in (-1,0,4097):
+    m.result=result; before=m.executed
+    assert signed(m.query_artists())==result and signed(m.query_artists())==result and m.executed==before+2
+m=ArtistCacheMachine()
+long_name=m.string('x'*150000)
+for r in m.found[:2]: m.word(r+O['REC_NAME'],long_name)
+assert m.query_artists()==2 and m.query_artists()==2 and m.executed==1  # fits 512 KiB, not the old 256 KiB
+m=ArtistCacheMachine()
+long_name=m.string('x'*300000)
+for r in m.found[:2]: m.word(r+O['REC_NAME'],long_name)
+assert m.query_artists()==2 and m.query_artists()==2 and m.executed==2  # byte cap, even with only two rows
+m=ArtistCacheMachine(); m.fail_strdup=True
+assert m.query_artists()==2 and m.query_artists()==2 and m.executed==2
+m=ArtistCacheMachine(); m.fail_create=True
+assert m.query_artists()==2 and m.query_artists()==2 and m.executed==2
+passed()
+m=album_class_machine
 class LibraryQueryMachine(Machine):
     def __init__(self):
-        super().__init__(); self.mock('strstr@GLIBC_2.0'); self.handlers.pop(syms['toolsQueryDbTable'])
+        super().__init__(); self.mock('strstr@GLIBC_2.0','strncmp@GLIBC_2.0'); self.handlers.pop(syms['toolsQueryDbTable'])
         self.db=sqlite3.connect(':memory:')
         self.db.execute('create table songtable(id,album,songer,albumsonger,fileurl,track,cd_num)')
         self.db.executemany('insert into songtable(id,album,songer,albumsonger,fileurl) values(?,?,?,?,?)',[
@@ -5484,11 +5719,42 @@ class LibraryQueryMachine(Machine):
         if address not in self.tramps: return super().hook(u,address,size,unused)
         a,b,c,d=[u.reg_read(r) for r in REGS]; self.sql=self.text(b)
         if self.tramps[address]=='content_query': self.content=(c,self.text(d),self.get(u.reg_read(UC_MIPS_REG_SP)+16))
-        elif self.tramps[address]=='dbquery': assert self.text(a)=='/mnt/data/database.db' and (c,d)==(123,1)
+        elif self.tramps[address]=='dbquery':
+            assert self.text(a)=='/mnt/data/database.db'
+            if not getattr(self,'real_callback',False):
+                assert (c,d)==(123,0 if self.get(payload_syms['library_probe']) or self.get(payload_syms['library_tracks_scope']) else 1)
         self.results=self.db.execute(self.sql).fetchall()
         if self.tramps[address]=='content_query': raise QueryDone  # stock's row handling after it isn't emulated
         self.returns(len(self.results))
 lm=LibraryQueryMachine(); AA="ifnull(nullif(albumsonger,''),songer)"
+# Unknown probes retain stock predicates and music exclusions, but return at most one row.
+lm.word(payload_syms['library_probe'],1)
+for scoped in (0,1):
+    lm.word(payload_syms['library_music'],scoped)
+    query='select * from songtable where songer=""'
+    lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string(query),123,1),gap=0)
+    assert len(lm.results)==(0 if scoped else 1) and lm.sql.endswith(' limit 1')
+lm.word(payload_syms['library_probe'],0)
+# Batch queries reuse the complete stock song projection, scope by literal album names, and do
+# not name-sort before Coverflow applies disc/track order. Shared compilations remain complete.
+lm.word(payload_syms['library_music'],1)
+lm.word(payload_syms['library_tracks_scope'],lm.string("album COLLATE NOCASE in ('shared')"))
+lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string('select * from songtable'),123,1),gap=0)
+assert [r[0] for r in lm.results]==[2] and 'album COLLATE NOCASE in' in lm.sql
+lm.db.executemany('insert into songtable(id,album,songer,albumsonger,fileurl) values(?,?,?,?,?)',
+                 [(100+i,'Shared','Guest','Various',f'/mnt/mmc/Music/Compilation/{i}.flac') for i in range(600)])
+lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string('select * from songtable'),123,1),gap=0)
+assert len(lm.results)==513 and lm.sql.endswith('limit 513')
+assert signed(lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),
+                     lm.string('select * from songtable ORDER BY id DESC'),123,1),gap=0))==-1
+# Exercise stock's real getAllMusic(3) assembly as well as the wrapper directly.
+lm.handlers.pop(syms['getAllMusic'],None); lm.real_callback=True
+lm.call(address=syms['getAllMusic'],args=(3,0,0,0),gap=0)
+assert len(lm.results)==513 and 'album COLLATE NOCASE in' in lm.sql and lm.sql.endswith('limit 513')
+lm.real_callback=False
+lm.db.execute('delete from songtable where id >= 100')
+lm.word(payload_syms['library_tracks_scope'],0)
+passed()
 for query in ('select id,songer from songtable group by songer COLLATE NOCASE',
               'select id,albumsonger from songtable group by albumsonger COLLATE NOCASE',
               'select id,album,songer,fileurl from songtable group by album COLLATE NOCASE',
@@ -5583,10 +5849,27 @@ for scoped,artist,want in ((0,'The Cure',{7,8}),(0,'',{6}),(1,'The Cure',{7,8}),
     lm.word(payload_syms['library_music'],scoped)
     try: lm.call(address=syms['getAlbumByAlbumArtist'],args=(lm.string(artist),),gap=0)
     except QueryDone: pass
-    assert lm.content[1:]==(artist,1) and AA in lm.sql and {r[0] for r in lm.results}==want,(artist,lm.sql,lm.results)
+    assert lm.content[1:]==(artist,1) and ('songer like' in lm.sql or AA in lm.sql) and {r[0] for r in lm.results}==want,(artist,lm.sql,lm.results)
 lm.word(payload_syms['library_music'],1); lm.sql=None
-assert lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string('select * from songtable'+' '*2048),123,1),gap=0)==-1
+assert lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string('select * from songtable'+' '*4096),123,1),gap=0)==-1
 assert lm.sql is None
+# The LIKE rewrite consumes the full escaped literal, not the first quote inside an artist name.
+from library_queries import macro as library_sql
+for i,artist in enumerate(("Artist's name", '100% Real', 'Under_score', 'Björk')):
+    lm.db.execute('insert into songtable(id,album,songer,albumsonger,fileurl) values(?,?,?,?,?)',(100+i,'Quoted',artist,'',f'/mnt/mmc/Music/{i}.flac'))
+for artist in ("Artist's name", '100% Real', 'Under_score', 'Björk', '', '%'):
+    literal="'"+artist.replace("'","''")+"'"
+    query='select id from songtable where albumsonger like '+literal
+    expected={r[0] for r in lm.db.execute("select id from songtable where ifnull(nullif(albumsonger,''),songer) like "+literal+' and '+library_sql('MUSIC_WHERE'))}
+    lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string(query),123,1),gap=0)
+    assert {r[0] for r in lm.results}==expected,(artist,lm.sql,lm.results)
+for predicate in ("albumsonger like 'The ' || 'Cure'", "albumsonger like '100!% Real' escape '!'",
+                  'albumsonger like "The Cure"'):
+    query='select id from songtable where '+predicate
+    expected={r[0] for r in lm.db.execute(query.replace('albumsonger',AA)+' and '+library_sql('MUSIC_WHERE'))}
+    lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string(query),123,1),gap=0)
+    assert {r[0] for r in lm.results}==expected,(predicate,lm.sql,lm.results)
+    if '||' in predicate or 'escape' in predicate: assert AA in lm.sql
 # Discovery is filtered before grouping, even when its tags collide with a main-library album.
 # The unscoped path retains every row for explicit folder/playlist use; moving a keeper back
 # into Music makes it visible on the next query, without deleting or retagging a database row.
@@ -5651,6 +5934,93 @@ for cls in (0xf00a,0xf008,0xf007,0xff20):
     q.call(address=HOOKS['load_localclass_list'][0],args=(cls,0,0,0),gap=0)
     assert q.names(q.get(syms['p_deque_showlist']))==(['Row 0','Row 1','Row 2'] if cls==0xff20 else ['Row 1','Row 2'])
     passed()
+# Exercise the complete one-rich-query Albums path through stock getAllAlbum, its actual row
+# callback, SQLite, staging and the existing C split/identity logic. Only toolkit/deque services
+# and the stock query execution boundary are mocked.
+class AlbumPrefetchMachine(ClassMachine):
+    dbtramp=int(manifest['patch_symbols']['stock_dbquery_trampoline'],16)
+    def __init__(self,enabled=True,extra=()):
+        super().__init__(rows=0); self.enabled=enabled; self.queries=[]; self.found=[]
+        self.db=sqlite3.connect(':memory:')
+        self.db.execute('create table songtable(id integer primary key,album,songer,fileurl,albumsonger,track default 0,cd_num default 0)')
+        self.db.executemany('insert into songtable(id,album,songer,fileurl,albumsonger) values(?,?,?,?,?)',[
+            (1,'Purple','Baroness','/mnt/mmc/Music/Baroness/1.flac','Baroness'),
+            (2,'Purple','STP','/mnt/mmc/Music/STP/1.flac','STP'),
+            (3,'Compilation','One','/mnt/mmc/Music/Various/1.flac','Various'),
+            (4,'Compilation','Two','/mnt/mmc/Music/Various/2.flac','Various'),
+            (5,'Multi','Artist','/mnt/mmc/Music/Multi/CD1/1.flac',''),
+            (6,'Multi','Artist','/mnt/mmc/Music/Multi/Disc 2/1.flac',''),
+            (7,'Spoken','Reader','/mnt/mmc/Audiobooks/Book/1.flac',''),
+            (8,"Quote's %_",'Artist','/mnt/mmc/Music/Quote/1.flac',''),
+            *extra])
+        self.db.executescript(library_sql('LIBRARY_INDEX_SQL'))
+        self.handlers.pop(syms['toolsQueryDbTable'],None)
+        for name in ('getAllAlbum','album_row'): self.handlers.pop(syms[name],None)
+        self.word(0xa26cc0-0xabc,0x1000014)  # stock album_row's lazy-bound malloc
+        self.mock('strstr@GLIBC_2.0','strncmp@GLIBC_2.0')
+    def hook(self,u,address,size,unused):
+        if address==0x1000014:
+            self.returns(self.alloc((u.reg_read(REGS[0])+3)&~3)); return
+        if address==syms['strcpy@GLIBC_2.0']:
+            a,b=[u.reg_read(r) for r in REGS[:2]]; u.mem_write(a,self.raw(b)+b'\0'); self.returns(a); return
+        if address==syms['sprintf@GLIBC_2.0']:
+            a,b,c,d=[u.reg_read(r) for r in REGS]; values=iter((c,d))
+            text=re.sub('%s',lambda _:self.text(next(values)),self.text(b))
+            u.mem_write(a,text.encode()+b'\0'); self.returns(len(text)); return
+        if address==syms['toolsQueryDbTable']: return Machine.hook(self,u,address,size,unused)
+        if address==syms['toolsHanziToPinyin']:
+            u.mem_write(u.reg_read(REGS[1]),b'#\0'); self.returns(0); return
+        if address==syms['music_nagvation_title']: self.returns(0); return
+        if address==self.tramp:
+            if not self.enabled: self.word(payload_syms['library_album_names'],0)
+            self.nested(syms['getAllAlbum'],0)
+            directory=self.get(syms['tools_pdeq_directory'])
+            shown=self.get(syms['p_deque_showlist'])
+            self.deqs[shown][1]=[self.copy('stSongInfo',r) for r in self.items(directory)]
+            self.deqs[directory][1]=[]
+            self.returns(len(self.items(shown))); return
+        if address==self.dbtramp:
+            db,sql,row,sort=[u.reg_read(r) for r in REGS]
+            query=self.text(sql); self.queries.append(query)
+            directory=self.get(syms['tools_pdeq_directory']); self.deqs[directory][1]=[]
+            try: result=self.db.execute(query)
+            except sqlite3.Error: self.returns(-1); return
+            columns=[c[0] for c in result.description]
+            for values in result.fetchall():
+                va=self.alloc(4*len(values)); ca=self.alloc(4*len(columns))
+                for i,(value,column) in enumerate(zip(values,columns)):
+                    self.word(va+4*i,0 if value is None else self.string(str(value)))
+                    self.word(ca+4*i,self.string(column))
+                assert self.nested(row,0,len(values),va,ca)==0
+            self.returns(len(self.items(directory))); return
+        return super().hook(u,address,size,unused)
+    def load(self):
+        return self.call(address=HOOKS['load_localclass_list'][0],args=(0xf003,0,0,0),gap=0,count=5_000_000)
+    def identities(self):
+        return [(self.get(r+O['REC_ID']),self.text(self.get(r+O['REC_ALBUM'])),
+                 self.text(self.get(r+O['REC_ALBUM_ARTIST'])),self.text(self.get(r+O['REC_PATH'])))
+                for r in self.items(self.get(syms['p_deque_showlist']))]
+for extra,fast in (((),True),
+                   (((9,'purple','Another','/mnt/mmc/Music/Other/1.flac','Another'),),False),
+                   (((9,'purple','Baroness','/mnt/mmc/Music/Baroness/2.flac','Baroness'),),False),
+                   (((9,'','Unknown','/mnt/mmc/Music/Unknown/1.flac',''),),False),
+                   (((9,None,'Unknown','/mnt/mmc/Music/Unknown/1.flac',''),),False)):
+    baseline=AlbumPrefetchMachine(False,extra); baseline.load()
+    prefetched=AlbumPrefetchMachine(True,extra); prefetched.load()
+    assert prefetched.identities()==baseline.identities(),(extra,prefetched.identities(),baseline.identities())
+    assert sum('group by' in q for q in baseline.queries)==2,(baseline.queries,baseline.identities())
+    assert sum('group by' in q for q in prefetched.queries)==(1 if fast else 2),prefetched.queries
+    assert ('select 1' in prefetched.queries)==fast
+    assert len(prefetched.deqs)==len(baseline.deqs)  # no retained prefetch deque after split
+    baseline.db.close(); prefetched.db.close()
+baseline=AlbumPrefetchMachine(False); baseline.load()
+unindexed=AlbumPrefetchMachine(True)
+unindexed.db.execute('drop index q2pod_album_nocase')
+unindexed.load()
+assert unindexed.identities()==baseline.identities() and 'select 1' not in unindexed.queries
+assert sum('group by' in q for q in unindexed.queries)==2
+baseline.db.close(); unindexed.db.close()
+passed()
 # Their stock art cache names (/mnt/mmc/.sldp/<md5>0.jpg): a shared name adds the album artist,
 # a name alone stays; the album page's big cover follows its row's cover task name.
 for e in m.items(m.get(syms['p_deque_showlist']))[:2]: m.word(e+O['REC_ALBUM_ARTIST'],m.get(e+O['REC_NAME']))
@@ -5669,6 +6039,8 @@ passed()
 # order, by folder, else by album artist; a name alone, and the songs tab, stay stock's.
 class ArtistMachine(ClassMachine):
     tramp=int(manifest['patch_symbols']['stock_artist_trampoline'],16)
+    def __init__(self,**kw):
+        super().__init__(**kw); self.mock('strstr@GLIBC_2.0','strncmp@GLIBC_2.0')
     def hook(self,u,address,size,unused):
         if address==syms['albumcoverinfo_init']:
             covers=[]
@@ -5726,6 +6098,7 @@ class ArtistCoverflow(ArtistMachine):
     def shown(self): return self.u.mem_read(self.top+0x34,1)[0]==0xff and self.nodes[self.top]['anim_hint']==SLIDE_HINT
     def hook(self,u,address,size,unused):
         if address!=payload_syms['coverflow_artist']: return super().hook(u,address,size,unused)
+        self.album_scope=self.text(u.reg_read(REGS[1]))
         self.handed.append(len(self.items(u.reg_read(REGS[0])))); self.covers=self.names(u.reg_read(REGS[0])); self.returns(1)
 for on,tab,page,want in ((1,1,'artistinfo_page',[1]),(2,1,'artistinfo_page',[1]),(0,1,'artistinfo_page',[]),(1,0,'artistinfo_page',[]),(1,1,'localclass_page',[])):
     m=ArtistCoverflow(page='localclass_page',cls=0xff01,rows=2); m.handed=[]
@@ -5778,6 +6151,7 @@ for mode in (0,1):
     assert m.names(m.get(syms['tools_pdeq_directory']))==staging
     m.advance(0)
     assert m.covers==['Selected','Guest'] and m.handed==[2],(mode,m.covers)
+    assert "songer like 'Artist'" in m.album_scope and (' union ' in m.album_scope)==bool(mode)
     assert m.names(m.get(syms['p_deque_showlist']))==['Row 0']  # the Library grid stays intact
     passed()
 # No albums in the selected artist query leaves the grid rather than opening an empty Coverflow.
@@ -9705,10 +10079,20 @@ for cf_open,view,found,want in ((True,'0',True,'coverflow_page'),(False,'1',True
 class AllAlbums(CoverflowMachine):
     def hook(self,u,address,size,unused):
         if self.handlers.get(address)=='q:getMusicByAlbum': self.found=self.by_album[self.text(u.reg_read(REGS[0]))]
+        if address==syms['getAllMusic']:
+            self.batch_queries=getattr(self,'batch_queries',0)+1
+            rows=[r for rows in self.by_album.values() for r in rows]
+            self.deqs[self.get(syms['tools_pdeq_directory'])][1]=[self.copy('stSongInfo',r) for r in rows]
+            self.returns(len(rows)); return
         return super().hook(u,address,size,unused)
 for albums,want in (([1,0],['c','d','a','b']),([0],None)):
     m=AllAlbums(); m.by_album={'Album 0':[track(m,'b','/p/b',1,2),track(m,'a','/p/a',1,1)],
                                'Album 1':[track(m,'d','/p/d',2,1),track(m,'c','/p/c',1,1)]}
+    for name,rows in m.by_album.items():
+        album=m.albums[int(name[-1])]
+        for r in rows:
+            for field in ('REC_ALBUM','REC_ALBUM_ARTIST'):
+                m.word(r+O[field],m.get(album+O[field]))
     m.top=m.node('window','artistinfo_page'); m.stack=[m.top]
     assert m.call(address=payload_syms['coverflow_artist'],args=(m.deque([m.albums[i] for i in albums]),0,0,0),gap=0)==1
     m.page=m.top; m.slide=m.find('slide_menu'); cards=m.nodes[m.slide]['children']
@@ -9717,7 +10101,20 @@ for albums,want in (([1,0],['c','d','a','b']),([0],None)):
         m.word(m.slide+O['SLIDE_INDEX'],2); m.press(100); assert m.hold()==0 and m.top==m.page
         f,ctx=m.handler(cards[2],O['EVT_CLICK']); m.call(address=f,args=(ctx,m.event,0,0),gap=0); m.advance(0)
         assert m.plays[-1][2:]==(0,0xf001,2) and m.play_names==want,(m.plays,m.play_names)
+        assert m.batch_queries==1
     passed()
+# More than sixteen albums require multiple bounded queries, but still concatenate in cover order.
+m=AllAlbums(albums=18); m.by_album={}
+for i,r in enumerate(m.albums):
+    song=track(m,f'Track {i}',f'/p/{i}',1,1)
+    for field in ('REC_ALBUM','REC_ALBUM_ARTIST'): m.word(song+O[field],m.get(r+O[field]))
+    m.by_album[f'Album {i}']=[song]
+m.top=m.node('window','artistinfo_page'); m.stack=[m.top]
+assert m.call(address=payload_syms['coverflow_artist'],args=(m.deque(m.albums),0,0,0),gap=0)==1
+m.page=m.top; m.slide=m.find('slide_menu'); cards=m.nodes[m.slide]['children']
+f,ctx=m.handler(cards[18],O['EVT_CLICK']); m.call(address=f,args=(ctx,m.event,0,0),gap=0); m.advance(0)
+assert m.batch_queries==2 and m.play_names==[f'Track {i}' for i in range(18)]
+passed()
 # Library Albums rows rate as covers do, their album split as Coverflow's.
 m=AlbumRateMachine(page='album_page',cls=O['CLASS_ALBUMS']); m.page=m.top; a0=m.aid(m.row(0))
 assert m.menu()==[*COVER_ALBUM,'Add to Playlist','Go to Artist']
@@ -19078,6 +19475,49 @@ for config,want in (({},1),({'ARTISTTYPE':'0'},0),({'ARTISTTYPE':'1'},1)):
     a.call(address=HOOKS['read_artistype_value'][0],args=(0,0,0,0),gap=0)
     assert a.get(syms['artist_type'])==want and a.config_reads[-1][1:3]==('PLAYSET','ARTISTTYPE'),config
 passed()
+# Index installation runs before browsing, retains data, is idempotent per library generation,
+# and retries missing/locked databases or failed DDL without affecting artist settings.
+class LibraryIndexMachine(Machine):
+    def __init__(self):
+        super().__init__(); self.db=sqlite3.connect(':memory:',isolation_level=None)
+        self.db.execute('create table songtable(id integer primary key,album,songer,albumsonger)')
+        self.db.execute("insert into songtable values(1,'Album','Artist','Artist')")
+        self.present.add('/mnt/data/database.db'); self.statements=[]; self.closed=0; self.fail=None
+        for name in ('sqlite3_open','sqlite3_close','sqlite3_exec'): self.handlers[syms[name]]='index:'+name
+    def hook(self,u,address,size,unused):
+        name=self.handlers.get(address,'')
+        if not name.startswith('index:'): return super().hook(u,address,size,unused)
+        a,b,c,d=[u.reg_read(r) for r in REGS]; ret=0
+        if name=='index:sqlite3_open':
+            assert self.text(a)=='/mnt/data/database.db'; self.word(b,123); ret=int(self.fail=='open')
+        elif name=='index:sqlite3_close': assert a==123; self.closed+=1
+        else:
+            assert a==123 and c==d==0
+            sql=self.text(b); self.statements.append(sql)
+            if self.fail and sql.startswith(self.fail): ret=1
+            else:
+                try:
+                    # executescript would commit an open transaction first; run each DDL directly.
+                    for statement in sql.split(';'):
+                        if statement.strip(): self.db.execute(statement)
+                except sqlite3.Error: ret=1
+        self.returns(ret)
+    def read(self): self.call(address=HOOKS['read_artistype_value'][0],args=(0,0,0,0),gap=0)
+    def indexes(self): return [r[1] for r in self.db.execute('pragma index_list(songtable)')]
+m=LibraryIndexMachine(); m.read()
+assert len(m.indexes())==3 and m.closed==1 and m.statements[-1]=='commit'
+assert m.db.execute('select * from songtable').fetchall()==[(1,'Album','Artist','Artist')]
+before=list(m.statements); m.read(); assert m.statements==before and m.closed==1
+m.word(payload_syms['library_gen'],1); m.read(); assert m.statements==before
+m.word(payload_syms['library_gen'],2); m.read(); assert len(m.indexes())==3 and m.closed==2
+for fail in ('open','begin','create','commit'):
+    m=LibraryIndexMachine(); m.fail=fail; m.read()
+    assert not m.indexes() and m.closed==1 and m.get(syms['artist_type'])==1
+    if fail in ('create','commit'): assert m.statements[-1]=='rollback'
+    m.fail=None; m.read(); assert len(m.indexes())==3 and m.closed==2
+m=LibraryIndexMachine(); m.present.clear(); m.read(); assert not m.statements and not m.closed
+m.present.add('/mnt/data/database.db'); m.read(); assert len(m.indexes())==3
+passed()
 # A FLAC's "ALBUM ARTIST" comment (foobar2000's spelling) when stock's libtag found no ALBUMARTIST (ringnav_music_info).
 class TagMachine(BooksMachine):
     def __init__(self,files):
@@ -19417,14 +19857,14 @@ assert press(m.dec)==X(0,2)  # a drag whose release sent nothing: the next step 
 passed()
 # Night Shift (nightshift.c): the main Display page's last row, after Appearance,
 # Coverflow and Controls; Q2POD NIGHTSHIFT and NIGHTK, 3400K unless a hundred in 2000-5000.
-for config,text in (({},'Off'),({'NIGHTSHIFT':'1'},'3400K'),({'NIGHTSHIFT':'1','NIGHTK':'2700'},'2700K'),({'NIGHTSHIFT':'1','NIGHTK':'5000'},'5000K'),
+for config,text in (({},'Off'),({'NIGHTSHIFT':'1'},'3400K'),({'NIGHTSHIFT':'2'},'Auto'),({'NIGHTSHIFT':'2','NIGHTK':'2700'},'Auto'),({'NIGHTSHIFT':'1','NIGHTK':'2700'},'2700K'),({'NIGHTSHIFT':'1','NIGHTK':'5000'},'5000K'),
                     ({'NIGHTSHIFT':'1','NIGHTK':'2750'},'3400K'),({'NIGHTSHIFT':'1','NIGHTK':'6500'},'3400K'),({'NIGHTK':'2000'},'Off')):
     m,rows,texts,icons,click=settings_page('display','scroll_view_display',config,stock_rows=3)
     label=m.nodes[m.nodes[rows[1]]['children'][0]]['children'][1]
     assert texts()[1]=='Night Shift: '+text and icons[1]=='display_backlight' and m.nodes[label]['name']=='label_night',config
     assert m.nodes[named(m,m.top,'scroll_view_display')]['children'][3]==rows[1],config  # after Smart Awake
 passed()
-# Its row opens the same page with its switch, Off. The switch turns it on and off and saves it; the
+# Its row opens the same page with its switch, Off. The switch cycles Off, On and Auto and saves it; the
 # wheel, +/- and the slider step 100K, warmer to the right, a move turning it on; each change repaints
 # the whole screen at once, a drag's every step too, but a drag saves once, at its release.
 m,rows,texts,icons,click=settings_page('display','scroll_view_display',stock_rows=3)

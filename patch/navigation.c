@@ -1,6 +1,7 @@
 /* Logical menu selection is independent of native touch focus. Stock code owns gestures. */
 #include "navigation.h"
 #include "playlist_art.h"
+#include "library.h"
 extern int stock_sorted_query_trampoline(const char *, const char *, void *, int);
 extern int stock_seek_time_trampoline(int);
 extern int stock_dbquery_trampoline(const char *, const char *, void *, int),
@@ -94,6 +95,13 @@ void ringnav_timezone_row(void *item, int i) {
 }
 static int library_music __attribute__((section(".scratch")));
 static int library_first __attribute__((section(".scratch")));
+static int library_artists __attribute__((section(".scratch")));
+static unsigned library_query_failures __attribute__((section(".scratch")));
+static int library_album_names __attribute__((section(".scratch")));
+extern int coverflow_album_prefetch(const char *, void *, int, int *);
+extern void coverflow_album_prefetch_drop(void);
+static const char *library_tracks_scope __attribute__((section(".scratch")));
+extern int artist_query_cached(int, const char *, const char *, void *, void *, int);
 
 /* Failed exec in a forked child must not flush demo's copied stdio or run its exit handlers. */
 __asm__(".globl child_exit\nchild_exit:\nli $v0, 4001\nsyscall\n");
@@ -119,17 +127,72 @@ void child_oom_first(void) {
  * queries, including Unknown and split albums, before grouping. Coverflow and folder queries keep
  * their own scope. */
 #define ALBUM_ARTIST_OR_ARTIST "ifnull(nullif(albumsonger,''),songer)"
+/* Only rewrite a complete stock LIKE literal. Doubled quote characters belong to the literal;
+ * malformed/other SQL retains the existing fallback expression. Never interpret LIKE wildcards. */
+static const char *artist_like_end(const char *s) {
+    if (strncmp(s, " like ", 6)) return 0;
+    const char *p = s + 6;
+    char quote = *p++;
+    if (quote != '\'' && quote != '"') return 0;
+    while (*p) {
+        if (*p++ == quote) {
+            if (*p != quote) {
+                const char *tail = p;
+                while (*tail == ' ' || *tail == '\t' || *tail == '\r' || *tail == '\n') ++tail;
+                /* A literal followed by ESCAPE, concatenation or another operator is not the
+                 * complete LIKE operand. Leave those expressions on the old fallback path. */
+                if (*tail && *tail != ')' && *tail != ';' &&
+                    strncasecmp(tail, "and ", 4) && strncasecmp(tail, "or ", 3) &&
+                    strncasecmp(tail, "group by ", 9) && strncasecmp(tail, "order by ", 9) &&
+                    strncasecmp(tail, "limit ", 6)) return 0;
+                return p;
+            }
+            ++p;
+        }
+    }
+    return 0;
+}
 /* toolsQueryDbTable, or (content) toolsQueryContentDbTable, which an artist's albums tab
  * (getAlbumByAlbumArtist) runs with its row's arg and the name sort on the stack. */
-static int library_query(int content, const char *db, const char *sql, void *row, void *arg,
-                         int sort) {
-    char aa[2048], filtered[2048];
-    const char *s = sql ? strstr(sql, "albumsonger") : 0, *p = sql;
+static int library_query_body(int content, const char *db, const char *sql, void *row, void *arg,
+                          int sort) {
+    if (library_album_names && library_music && !content && (int)arg == 1 &&
+        !strcmp(db, "/mnt/data/database.db") && sql &&
+        !strcmp(sql, "select id,album,songer,fileurl from songtable group by album COLLATE NOCASE")) {
+        int n, saved = library_album_names;
+        library_album_names = 0; /* the richer query must not recurse into this path */
+        int used = coverflow_album_prefetch(db, row, (int)arg, &n);
+        library_album_names = saved;
+        if (used) return n;
+    }
+    char aa[4096], filtered[4096];
+    if (library_tracks_scope) {
+        /* getAllMusic(3) actually orders by creation time. Replace that unused order as well;
+         * unfamiliar stock SQL must fail back to per-album loading, never fetch an unbounded list. */
+        if (!sql || (strcmp(sql, "select * from songtable") &&
+            strcmp(sql, "select * from songtable ORDER BY time_create desc;"))) return -1;
+        int n = tk_snprintf(aa, sizeof aa, "select * from songtable where (%s) limit 513", library_tracks_scope);
+        if (n < 0 || (unsigned)n >= sizeof aa) return -1;
+        sql = aa;
+        arg = (void *)(content == 2); /* sorted-query mode 1 bypasses its name sort */
+    }
+    const char *s = sql && !library_tracks_scope ? strstr(sql, "albumsonger") : 0, *p = sql;
     if (s && !strstr(sql, "ifnull(albumsonger")) {
         unsigned n = 0;
-        for (; s && n < sizeof aa; p = s + 11, s = strstr(p, "albumsonger"))
-            n += (unsigned)tk_snprintf(aa + n, sizeof aa - n, "%.*s" ALBUM_ARTIST_OR_ARTIST,
-                                       (int)(s - p), p);
+        for (; s && n < sizeof aa; s = strstr(p, "albumsonger")) {
+            const char *end = artist_like_end(s + 11);
+            n += (unsigned)tk_snprintf(aa + n, sizeof aa - n, "%.*s", (int)(s - p), p);
+            if (n >= sizeof aa) break;
+            if (end) {
+                const char *literal = s + 17;
+                n += (unsigned)tk_snprintf(aa + n, sizeof aa - n, ALBUM_ARTIST_MATCH,
+                                           (int)(end - literal), literal, (int)(end - literal), literal);
+                p = end;
+            } else {
+                n += (unsigned)tk_snprintf(aa + n, sizeof aa - n, ALBUM_ARTIST_OR_ARTIST);
+                p = s + 11;
+            }
+        }
         if (n >= sizeof aa ||
             n + (unsigned)tk_snprintf(aa + n, sizeof aa - n, "%s", p) >= sizeof aa)
             return -1;
@@ -167,12 +230,24 @@ static int library_query(int content, const char *db, const char *sql, void *row
     }
     /* no memory to expand it: the token alone is SQL's 1, the whole library (library_scope.c) */
     char *expanded = sql && strstr(sql, LIBRARY_SCOPE_TOKEN) ? library_scope_query(sql) : 0;
-    const char *query = expanded ? expanded : sql;
-    int result = content == 2 ? stock_sorted_query_trampoline(db, query, row, (int)arg)
-                 : content    ? stock_content_query_trampoline(db, query, row, arg, sort)
-                              : stock_dbquery_trampoline(db, query, row, (int)arg);
+    if (expanded) sql = expanded;
+    int result;
+    if (library_first && sql) {
+        /* Upstream adds LIMIT 1 before scope expansion. Do not append another LIMIT or sort. */
+        if (content == 2) result = stock_sorted_query_trampoline(db, sql, row, 1);
+        else result = content ? stock_content_query_trampoline(db, sql, row, arg, 0)
+                              : stock_dbquery_trampoline(db, sql, row, 0);
+    } else if (library_artists) result = artist_query_cached(content, db, sql, row, arg, sort);
+    else result = content == 2 ? stock_sorted_query_trampoline(db, sql, row, (int)arg)
+                  : content   ? stock_content_query_trampoline(db, sql, row, arg, sort)
+                              : stock_dbquery_trampoline(db, sql, row, (int)arg);
     if (expanded) free(expanded);
     return result;
+}
+static int library_query(int content, const char *db, const char *sql, void *row, void *arg, int sort) {
+    int n = library_query_body(content, db, sql, row, arg, sort);
+    if (n < 0) ++library_query_failures;
+    return n;
 }
 int ringnav_library_query(const char *db, const char *sql, void *row, int sort) {
     return library_query(0, db, sql, row, (void *)sort, 0);
@@ -245,6 +320,8 @@ extern int album_only(void *, void *, int), coverflow_split(void *);
 #define SHORT_LIST_MAX 16
 scratch_t st __attribute__((section(".scratch")));
 
+extern int category_get(int cls);
+extern void category_keep(int cls, unsigned gen, int n);
 /* Single shared view: no entry point keeps a menu live across a nested load(). */
 menu_t g_menu __attribute__((section(".scratch")));
 
@@ -3223,11 +3300,32 @@ static int bt_link(void) {
     pod_settings();
     return bt_vol_link;
 }
+/* Install on boot, not inside an album query. A scan can recreate the database: the next artist
+ * settings read retries after its generation changes. Missing/locked/read-only databases remain
+ * usable without indexes, and failed attempts are never marked complete. */
+static void ringnav_library_indexes(void) {
+    unsigned gen = library_gen;
+    void *db = 0;
+    if ((gen & 1) || (st.library_indexed && st.library_index_gen == gen) ||
+        access("/mnt/data/database.db", 0)) return;
+    if (sqlite3_open("/mnt/data/database.db", &db)) goto done;
+    if (sqlite3_exec(db, "begin immediate", 0, 0, 0)) goto done;
+    if (sqlite3_exec(db, LIBRARY_INDEX_SQL, 0, 0, 0) ||
+        sqlite3_exec(db, "commit", 0, 0, 0)) {
+        sqlite3_exec(db, "rollback", 0, 0, 0);
+    } else if (gen == library_gen) {
+        st.library_indexed = 1;
+        st.library_index_gen = gen;
+    }
+done:
+    if (db) sqlite3_close(db);
+}
 /* read_artistype_value (a Library list's or artist page's init) and boot (playback.c
  * ringnav_bootmode): Artists as stock reads it, PLAYSET ARTISTTYPE, but Album Artist when no choice
  * is saved; stock writes the key only when Artists or the artist page's switch toggles. */
 void ringnav_read_artistype(void) {
     I(artist_type, 0) = config_value("PLAYSET", "ARTISTTYPE", 2, 1);
+    ringnav_library_indexes();
 }
 /* checkBluetoothStatus' player_save_start(0) once a headset's A2DP comes up (tools/build.py
  * BT_CONNECT_START): player_save_stop stopped the local or Tidal queue, and stock restarts it
@@ -7886,14 +7984,27 @@ static int artist_album(void *all, void *r) {
         }
     return -1;
 }
-extern int coverflow_artist(void *albums);
-extern void coverflow_by_year(void *albums);
+extern int coverflow_artist(void *albums, const char *scope);
+extern int coverflow_split_scoped(void *albums, const char *scope);
+extern void coverflow_by_year(void *albums, const char *scope);
+/* This restricts metadata queries by album name, not album identity. Shared-name albums must
+ * still be visible to split_key; artist_albums does the final membership check. */
+static void artist_scope(char *sql, unsigned cap) {
+    char quoted[520];
+    unsigned n = 0;
+    const char *artist = g_local_classinfo_save[0xa] ? "" : (const char *)g_local_classinfo_save + 0x10d;
+    *sql = 0;
+    if (!library_quote(quoted, sizeof quoted, &n, artist)) return;
+    int size = tk_snprintf(sql, cap, I(artist_type, 0) == 1 ? ALBUM_ARTIST_ALBUM_SCOPE : ARTIST_ALBUM_SCOPE,
+                           quoted, quoted);
+    if (size < 0 || (unsigned)size >= cap) *sql = 0; /* preserve the old path on overflow */
+}
 static int artist_songs(void *unused) {
     return (I(artist_type, 0) == 1 ? getMusicByAlbumArtist : getMusicBySonger)(
         g_local_classinfo_save[0xa] ? (const char *)0
                                     : (const char *)g_local_classinfo_save + 0x10d);
 }
-/* Split artwork keys use the whole library; the layout uses only this artist's albums. */
+/* Split artwork keys include all artists sharing these album names; the layout is this artist's. */
 static void *artist_albums(void *all) {
     int n;
     void *songs = staged_music(artist_songs, 0, &n), *out = _create_deque("stSongInfo");
@@ -7951,10 +8062,12 @@ static int artist_cf_open(const void *unused) {
          *veiled = st.art_cf_veil;
     st.art_cf_timer = 0;
     st.art_cf_list = st.art_cf_veil = (void *)0;
-    if (veiled && top == veiled && coverflow_artist(all))
+    if (veiled && top == veiled && coverflow_artist(all, st.art_cf_scope))
         st.art_cf_win = top;
     else
         deque_destroy(all);
+    free(st.art_cf_scope);
+    st.art_cf_scope = 0;
     if (veiled) cf_veil(veiled, 0);
     return 0;
 }
@@ -7996,11 +8109,13 @@ static int artist_list(int tab) {
     st.art_n = (unsigned)n;
     all = _create_deque("stSongInfo");
     deque_init_copy(all, list);
-    coverflow_split(all);
+    char scope[1536];
+    artist_scope(scope, sizeof scope);
+    coverflow_split_scoped(all, scope);
     /* The artist's albums by year (Playback settings' Year order) or A-Z, the grid's rows in
      * theirs. */
     void *mine = artist_albums(all);
-    coverflow_by_year(mine);
+    coverflow_by_year(mine, scope);
     artist_order(list, mine);
     for (unsigned i = 0; i < st.art_n && i < deque_size(list); ++i) {
         void *r = deque_at(list, i);
@@ -8017,6 +8132,7 @@ static int artist_list(int tab) {
     if (st.artist_cf && !st.art_cf_list && top && top != st.art_cf_win &&
         !tk_strcmp(widget_get_prop_str(top, "name", ""), "artistinfo_page")) {
         st.art_cf_list = mine, mine = 0;
+        st.art_cf_scope = strdup(scope); /* NULL safely falls back to full-library metadata */
         st.art_cf_veil = top;
         cf_veil(top, 1);
         widget_on(top, EVT_DESTROY, artist_cf_gone, top);
@@ -8183,10 +8299,22 @@ static int songs_load(void) {
 }
 
 int ringnav_localclass(int cls) {
+    unsigned gen = library_gen;
+    unsigned failures = library_query_failures;
+    int cache_ok = 1;
     I(g_artist_type, 0) = I(artist_type, 0) == 1;
+    /* Also invalidate retained categories on detail navigation during a scan/settings change. */
+    int hit = category_get(cls);
+    if (hit >= 0) return hit;
     int saved = library_music;
     library_music = 1;
+    int cached = library_artists;
+    library_artists = cls == 0xf004;
+    int album_names = library_album_names;
+    library_album_names = cls == CLASS_ALBUMS;
     int n = cls == 0xf001 ? songs_load() : stock_localclass_trampoline(cls);
+    library_artists = cached;
+    library_album_names = album_names;
     void *list = P(p_deque_showlist, 0), *dir = P(tools_pdeq_directory, 0), *a = album_opened();
     if (n > 0 && cls == 0xff20) n = music_records(list, 0);
     /* These stored lists bypass songtable too. Keep Discovery out of their displayed copies,
@@ -8194,6 +8322,7 @@ int ringnav_localclass(int cls) {
     if (n > 0 && (cls == 0xf00a || cls == 0xf008 || cls == 0xf007)) n = music_records(list, 1);
     if (n > 0 && cls == 0xff10 && a) album_only(list, a, 0), n = (int)deque_size(list);
     if (n > 0 && cls == CLASS_ALBUMS) n = coverflow_split(list);
+    if (cls == CLASS_ALBUMS) coverflow_album_prefetch_drop();
     if (n > 0 && (cls == 0xf00a || cls == 0xf008 || cls == 0xf007)) /* My Fav, Frequent, Recent */
         fav_titles(list, n);
     /* an untagged song's row reads its file name without the extension (track_name). Bounded by
@@ -8212,10 +8341,12 @@ int ringnav_localclass(int cls) {
         return n;
     }
     if (n > 0 && I(deque_at(list, (unsigned)n - 1), REC_ID) == -1) {
-        library_first = 1; /* a song is enough: its query stops at the first (library_query) */
-        class_query((unsigned)cls, deque_at(list, (unsigned)n - 1));
-        library_first = 0;
-        int empty = !deque_size(dir);
+        int probing = library_first;
+        library_first = 1;
+        int found = class_query((unsigned)cls, deque_at(list, (unsigned)n - 1));
+        if (found < 0) cache_ok = 0;
+        library_first = probing;
+        int empty = found >= 0 && !deque_size(dir);
         deque_clear(dir);
         if (empty) deque_pop_back(list), n--;
     }
@@ -8224,6 +8355,7 @@ int ringnav_localclass(int cls) {
         st.empty_kind = cls - CLASS_ALBUMS;
         timer_add(empty_toast, (void *)0, 0);
     }
+    if (cache_ok && failures == library_query_failures) category_keep(cls, gen, n);
     return n;
 }
 
@@ -8339,6 +8471,14 @@ int songs_unsorted(void *music) {
     int n = getAllMusic(3);
     library_music = saved;
     return n;
+}
+/* Reuse stock's full song-record callback, but fetch only the batch's album names. */
+void *library_album_batch(const char *scope, int *count) {
+    const char *saved = library_tracks_scope;
+    library_tracks_scope = scope;
+    void *rows = staged(songs_unsorted, (void *)1, count);
+    library_tracks_scope = saved;
+    return rows;
 }
 
 /* Return for the payload's own pages; each passes page_open its own close. */

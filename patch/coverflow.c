@@ -688,6 +688,8 @@ static const unsigned char rated_sorts[] = { SORT_RATING, SORT_ALBUM, SORT_ARTIS
 static const unsigned char all_sorts[] = { SORT_ALBUM, SORT_ARTIST, SORT_YEAR,
                                            SORT_ADDED, SORT_PLAYED, SORT_RANDOM };
 #define ALBUM_SQL "select id,album,songer," ALBUM_TRACK ",albumsonger from songtable" ALBUM_GROUP
+#define ALBUM_PREFETCH_SQL "select id,album,songer," ALBUM_TRACK ",albumsonger," \
+    "count(distinct album COLLATE BINARY) from songtable" ALBUM_GROUP
 #define MUSIC_ALBUM_SQL "select case when ifnull(album,'')='' then -1 else id end," \
     "case when ifnull(album,'')='' then 'Unknown Album' else album end," \
     "songer," ALBUM_TRACK ",albumsonger from songtable where " \
@@ -1171,12 +1173,124 @@ static int split_row(void *a, int n, char **v, char **c) {
 }
 static int rank_query(void *sql) { return toolsQueryDbTable("/mnt/data/database.db", sql, split_row, 0); }
 
+/* Reuse rich groups for the Library Albums name query and its subsequent split. A single
+ * spelling per name is required: otherwise choosing a different case representative could
+ * change stock's ordering. Unknown/ambiguous/oversized lists keep the original two-query path. */
+static struct {
+    void *rows, *row;
+    unsigned gen, bytes;
+    int good, compatible;
+} album_prefetch __attribute__((section(".scratch")));
+extern int stock_dbquery_trampoline(const char *, const char *, void *, int);
+void coverflow_album_prefetch_drop(void) {
+    if (album_prefetch.rows) deque_destroy(album_prefetch.rows);
+    album_prefetch.rows = 0;
+}
+static int prefetch_row(void *a, int n, char **v, char **c) {
+    if (!album_prefetch.good) return 0;
+    void *dir = P(tools_pdeq_directory, 0);
+    if (n != 6 || !v[1] || !*v[1] || !v[5] || deque_size(dir) >= 8192) {
+        album_prefetch.good = 0;
+        return 0;
+    }
+    if (atoi(v[5]) != 1) album_prefetch.compatible = 0;
+    unsigned bytes = album_prefetch.bytes + 0x60 + 96;
+    for (unsigned i = 1; i < 5; ++i) if (v[i]) bytes += (unsigned)strlen(v[i]) + 1;
+    bytes += 2 * ((unsigned)strlen(v[1]) + 1); /* name/title/album copies, not just SQL columns */
+    if (bytes > 2 * 1024 * 1024) { album_prefetch.good = 0; return 0; }
+    unsigned k = deque_size(dir);
+    if (k) {
+        const char *previous = P(deque_at(dir, k - 1), REC_ALBUM);
+        if (!strcasecmp(previous, v[1]) && strcmp(previous, v[1])) album_prefetch.compatible = 0;
+    }
+    album_prefetch.bytes = bytes;
+    return split_row(a, 5, v, c);
+}
+static int prefetch_unknown(void *a, int n, char **v, char **c) {
+    album_prefetch.good = 0;
+    return 0;
+}
+static int prefetch_query(void *unused) {
+    /* Usually an index-only, one-row check. Unknown albums keep their original placeholders
+     * without first paying for a rich grouping that cannot supply their stock name rows. */
+    int n = stock_dbquery_trampoline("/mnt/data/database.db",
+        "select 1 from songtable indexed by q2pod_album_nocase where (album is null or album COLLATE NOCASE='') and "
+        MUSIC_WHERE " limit 1", prefetch_unknown, 0);
+    if (n < 0 || !album_prefetch.good) return -1;
+    return toolsQueryDbTable("/mnt/data/database.db", ALBUM_PREFETCH_SQL, prefetch_row, 0);
+}
+static int prefetched_names(void *a, int unused, char **values, char **columns) {
+    const char *last = 0;
+    int (*row)(void *, int, char **, char **) = album_prefetch.row;
+    char *names[] = { "id", "album", "songer", "fileurl" };
+    for (unsigned i = 0; i < deque_size(album_prefetch.rows); ++i) {
+        void *r = deque_at(album_prefetch.rows, i);
+        const char *name = P(r, REC_ALBUM);
+        if (last && !strcasecmp(last, name)) continue;
+        last = name;
+        char id[16];
+        snprintf(id, sizeof id, "%d", I(r, REC_ID));
+        char *v[] = { id, (char *)name, P(r, REC_ARTIST), P(r, REC_PATH) };
+        int rc = row(a, 4, v, names);
+        if (rc) return rc;
+    }
+    return 0;
+}
+int coverflow_album_prefetch(const char *db, void *row, int sort, int *count) {
+    coverflow_album_prefetch_drop();
+    unsigned gen = library_gen;
+    if (gen & 1) return 0;
+    album_prefetch.good = album_prefetch.compatible = 1, album_prefetch.bytes = 256;
+    int n;
+    void *rows = staged(prefetch_query, 0, &n);
+    if (n <= 0 || !album_prefetch.good || gen != library_gen) {
+        deque_destroy(rows);
+        return 0;
+    }
+    album_prefetch.rows = rows, album_prefetch.gen = gen, album_prefetch.row = row;
+    if (!album_prefetch.compatible) {
+        /* Retain the complete rich metadata for split, but obtain the original name rows and
+         * their exact case/tie ordering normally. This still does only two grouping queries. */
+        return 0;
+    }
+    /* A constant query lets stock execute the original name-row callback and its original name
+     * sort exactly once. No songtable grouping remains in this name-materialization step. */
+    *count = stock_dbquery_trampoline(db, "select 1", prefetched_names, sort);
+    if (*count <= 0 || gen != library_gen) {
+        coverflow_album_prefetch_drop();
+        return 0;
+    }
+    return 1;
+}
+
+/* Keep the album grouping and ordering unchanged, but limit their input before GROUP BY. The
+ * scope comes from artist membership's album names, including same-named albums by other artists.
+ * NULL names are retained for stock's Unknown row. Never execute truncated SQL. */
+typedef struct { const char *sql, *scope; } album_query_t;
+static int scoped_rank_query(void *arg) {
+    const album_query_t *q = arg;
+    const char *from = strstr(q->sql, " from songtable");
+    char sql[3072];
+    if (!from) return rank_query((void *)q->sql);
+    const char *tail = from + 15;
+    int where = !strncmp(tail, " where ", 7);
+    int n = tk_snprintf(sql, sizeof sql, "%.*s from songtable where (%s)%s%s",
+                        (int)(from - q->sql), q->sql, q->scope, where ? " and " : "",
+                        tail + (where ? 7 : 0));
+    if (n < 0 || (unsigned)n >= sizeof sql) return rank_query((void *)q->sql);
+    return rank_query(sql);
+}
+static void *album_query(const char *sql, const char *scope, int *n) {
+    album_query_t q = { sql, scope };
+    return scope && *scope ? staged(scoped_rank_query, &q, n) : staged(rank_query, (void *)sql, n);
+}
+
 /* list's albums with music, in a new deque (list goes), using a music track for their art even when
  * tags are shared with an audiobook. The card's files stay untouched. Out of memory,
  * audiobooks stay. */
-static void *music_albums(void *list) {
+static void *music_albums(void *list, const char *scope) {
     int n;
-    void *rows = staged(rank_query, MUSIC_ALBUM_SQL, &n), *out;
+    void *rows = album_query(MUSIC_ALBUM_SQL, scope, &n), *out;
     unsigned m;
     row_t *v = album_rows(rows, &m, by_album, 0);
     if (!v) return deque_destroy(rows), list;
@@ -1198,9 +1312,13 @@ static void *music_albums(void *list) {
  * name's ALBUM_SQL rows, one per album_cmp album (the SQL keeps disc folders apart), in its place;
  * a row the query missed stays. Out of memory, the rows stay unsplit. ponytail: a scan of the
  * name's albums so far per row, its albums squared; fine unless one name has thousands. */
-static void *split(void *stock) {
+static void *split(void *stock, const char *scope) {
     int n;
-    void *rows = staged(rank_query, ALBUM_SQL, &n), *out;
+    void *rows, *out;
+    if (!scope && album_prefetch.rows && album_prefetch.gen == library_gen) {
+        rows = album_prefetch.rows;
+        album_prefetch.rows = 0;
+    } else rows = album_query(ALBUM_SQL, scope, &n);
     unsigned m;
     row_t *v = album_rows(rows, &m, by_name, 1);
     if (!v) return deque_destroy(rows), stock;
@@ -1222,15 +1340,16 @@ static void *split(void *stock) {
     return out;
 }
 /* navigation.c's Albums list (load_localclass_list 0xf003), split in place as Coverflow's: its size. */
-int coverflow_split(void *list) {
+int coverflow_split_scoped(void *list, const char *scope) {
     void *copy = _create_deque("stSongInfo"), *out;
     deque_init_copy(copy, list);
-    out = split(copy);
+    out = split(copy, scope);
     deque_clear(list);
     deque_assign(list, out);
     deque_destroy(out);
     return (int)deque_size(list);
 }
+int coverflow_split(void *list) { return coverflow_split_scoped(list, 0); }
 /* list down to r's album (album_cmp), in order and in place, unless none is; then at's index. An
  * untagged r keeps every untagged song the card lists (spoken and scoped-out ones left out, as
  * MUSIC_WHERE, which stock's getMusicByAlbum(NULL) skips at resume), and r: the Unknown Album card
@@ -1331,7 +1450,7 @@ static void *sorted(void) {
 extern int ringnav_artist_az(void);
 /* albums (split's rows) in place by year, as year_sql, or by name (Playback's Artist album order
  * A-Z): the query's order, then the albums it missed, then the Unknown album. navigation.c's artist pages. Out of memory they keep their order. */
-void coverflow_by_year(void *albums) {
+void coverflow_by_year(void *albums, const char *scope) {
     unsigned n = deque_size(albums), m;
     char *taken = calloc(n + 1, 1);
     row_t *v = taken ? album_rows(albums, &m, by_album, 0) : 0;
@@ -1340,7 +1459,7 @@ void coverflow_by_year(void *albums) {
         free(taken);
         return;
     }
-    void *rows = staged(rank_query, (void *)(ringnav_artist_az() ? SORT_SQL "album COLLATE NOCASE" : year_sql()), &found), *out = _create_deque("stSongInfo");
+    void *rows = album_query(ringnav_artist_az() ? SORT_SQL "album COLLATE NOCASE" : year_sql(), scope, &found), *out = _create_deque("stSongInfo");
     deque_init(out);
     for (unsigned j = 0; j < deque_size(rows); ++j) {
         int i = album_in(v, m, deque_at(rows, j));
@@ -2964,9 +3083,9 @@ static void load_albums(unsigned t0) {
         cf.stock = staged(albums, 0, &n);
         cf_trace(t0, "staged albums=", n, 0);
         if (n > 0) {
-            void *v = split(cf.stock);
+            void *v = split(cf.stock, 0);
             cf_trace(t0, "split albums=", deque_size(v), 0);
-            cf.stock = music_albums(v);
+            cf.stock = music_albums(v, 0);
             cf_trace(t0, "music_albums albums=", deque_size(cf.stock), 0);
         }
         cf.albums_gen = gen;
@@ -3128,7 +3247,9 @@ const char *track_name(char *buf, unsigned size, void *t) {
 extern void *staged_music(int (*query)(void *), void *arg, int *count);
 void *coverflow_album_tracks(void *r) {
     int n;
-    return in_order(staged_music(albums, r, &n), r);
+    void *tracks = staged_music(albums, r, &n);
+    tracks = in_order(tracks, r);
+    return tracks;
 }
 
 /* A label's face at px, in every state the labels style: bold, the theme's (bold itself), by its
@@ -3376,17 +3497,61 @@ static int to_tracks(const void *unused) {
     return 0;
 }
 
-/* The All albums card: every album's tracks, the covers' order and each album's in album order,
- * from the first, as a library queue (0xff10 would resume one album of the name). ponytail: a
- * query per album; one artist query split back into albums if a large artist drags. */
+extern void *library_album_batch(const char *, int *);
+/* Bounded batches retain complete compilations and album/folder identity, not just the selected
+ * artist's tracks. Exact names suffice: in_order discards LIKE wildcard-only matches anyway. */
+static unsigned album_batch_scope(char *sql, unsigned cap, unsigned first) {
+    unsigned n = (unsigned)snprintf(sql, cap, "album COLLATE NOCASE in ("), i = first;
+    for (; i < deque_size(cf.albums) && i - first < 16; ++i) {
+        void *r = deque_at(cf.albums, i);
+        const char *name = I(r, REC_ID) == -1 ? "" : P(r, REC_ALBUM);
+        unsigned need = 4;
+        for (const char *p = name ? name : ""; *p; ++p) need += 1 + (*p == '\'');
+        if (need >= cap - n) break;
+        if (i != first) sql[n++] = ',';
+        sql[n++] = '\'';
+        for (const char *p = name ? name : ""; *p; ++p) {
+            sql[n++] = *p;
+            if (*p == '\'') sql[n++] = '\'';
+        }
+        sql[n++] = '\'';
+    }
+    sql[n++] = ')', sql[n] = 0;
+    return i;
+}
+/* The All albums card: covers' order, then disc/track/path/CUE order within each album. */
 static int play_all(const void *unused) {
     cf.timer = 0;
     void *all = _create_deque("stSongInfo");
     deque_init(all);
-    for (unsigned i = 0; i < deque_size(cf.albums); ++i) {
-        void *t = coverflow_album_tracks(deque_at(cf.albums, i));
-        for (unsigned j = 0; j < deque_size(t); ++j) _deque_push_back(all, deque_at(t, j));
-        deque_destroy(t);
+    for (unsigned i = 0; i < deque_size(cf.albums);) {
+        char scope[3072];
+        unsigned end = album_batch_scope(scope, sizeof scope, i);
+        int n = -1;
+        void *batch = end > i ? library_album_batch(scope, &n) : 0;
+        if (!batch || n < 0 || n > 512) { /* never play a truncated/failed batch */
+            if (batch) deque_destroy(batch);
+            batch = 0;
+            end = i + 1;
+        }
+        for (; i < end; ++i) {
+            void *r = deque_at(cf.albums, i), *t;
+            if (!batch) t = coverflow_album_tracks(r);
+            else {
+                t = _create_deque("stSongInfo");
+                deque_init(t);
+                for (unsigned j = 0; j < deque_size(batch); ++j) {
+                    void *song = deque_at(batch, j);
+                    const char *name = P(song, REC_ALBUM);
+                    if (I(r, REC_ID) == -1 ? name && !*name : !album_cmp(song, r))
+                        _deque_push_back(t, song);
+                }
+                t = in_order(t, r);
+            }
+            for (unsigned j = 0; j < deque_size(t); ++j) _deque_push_back(all, deque_at(t, j));
+            deque_destroy(t);
+        }
+        if (batch) deque_destroy(batch);
     }
     if (deque_size(all) && !access(P(deque_at(all, 0), REC_PATH), 0))
         play_folder(all, 0, 0xf001);
@@ -3574,11 +3739,11 @@ static int scoped_open(void) {
 
 /* Display settings' Artist albums: Coverflow (navigation.c): albums, coverflow_split's, as the
  * covers, which the page owns; 0 when there are none, and albums is the caller's. */
-int coverflow_artist(void *albums) {
+int coverflow_artist(void *albums, const char *scope) {
     if (!deque_size(albums)) return 0;
     void *music = _create_deque("stSongInfo");
     deque_init_copy(music, albums);
-    music = music_albums(music);
+    music = music_albums(music, scope);
     if (!deque_size(music) || !scoped_open()) {
         deque_destroy(music);
         return 0;
@@ -3628,8 +3793,8 @@ int coverflow_shows_album(void *r) {
 int coverflow_rated(int (*hearts)(void *)) {
     int n;
     void *all = staged(albums, 0, &n), *rated = _create_deque("stSongInfo");
-    if (n > 0) all = split(all);
-    all = music_albums(all);
+    if (n > 0) all = split(all, 0);
+    all = music_albums(all, 0);
     deque_init(rated);
     for (unsigned i = 0; i < deque_size(all); ++i)
         if (hearts(deque_at(all, i))) _deque_push_back(rated, deque_at(all, i));

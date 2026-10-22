@@ -566,6 +566,7 @@ DIALOG_CLOSE = 0x652874
 # slot) becomes jal ringnav_scan_dir, which skips every hidden folder, as Folder view's list does: a card
 # app's own (q2-deezer's stream cache) never joins the Library.
 SCAN_DIRS = (0x5d6864, 0x0320f809)
+NAME_SORT_CALLS = (0x5dae90, 0x5db0c8, 0x5db494)  # complete staging deque in DB query helpers (V1.36)
 # Library Albums' cover cache names (navigation.c art_key): the row renderer's snprintf of the name,
 # with a2 the row (addiu a2,"%s" becomes move a2,s3), the Albums page's albumcoverinfo_init calls
 # and the album page's big cover snprintf become jal to the payload; so do an artist page's albums
@@ -1459,6 +1460,9 @@ FUNCTIONS = {
  'mclSetPcmMode': ('int', 'void'),
  'mclSetMute': ('int', 'int'),
  'toolsTrimLeft': ('void', 'char *'),
+ 'music_nagvation_title': ('void', 'int'),
+ 'algo_sort_if': ('void', 'unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *'),
+ 'song_record_copy': ('void', 'void *, const void *, int *'),
  'switch_charge_enable': ('int', 'int'),  # 1 charges: the active-low charge enable on GPIO PE22 (usbmode_page_init)
  'toolsGpioSetValue': ('int', 'const char *, int'),
  'toolsGpioGetValue': ('int', 'const char *'),  # USB charge inhibit readback, not a current measurement
@@ -1506,6 +1510,7 @@ PRIVATE_FUNCTIONS = {
     "album_row": 0x506e94,  # getAllAlbum's sqlite3_exec callback: id, album, songer, fileurl to a record
     "folder_refresh": 0x531efc,  # folder_page's navbar and table from p_deque_showlist (its init, back)
     "class_icon": 0x4b2268,  # a category row's picture: the head for Artists, a genre icon, else .downpic
+    "song_record_copy": 0x5c65ac,  # V1.36 stsonginfo_copy: owning assignment, frees then duplicates strings
     "screensaver_rows": HOOKS['screensaver_rows'][0],  # the Lock screen page's rows and picture grid
     "folder_click": HOOKS['folder_click'][0],  # folder_page's row click (folder_enter, then a file's queue)
     "saver_cover": HOOKS['saver_cover'][0],  # the lock window's img_playcover from the playing track
@@ -1612,7 +1617,7 @@ def compile_payload(out):  # pragma: no mutate block
         f'--undefined={WM_PAINT_LEAF[2]}', f'--undefined={QUEUE_LEAF[2]}', '--undefined=ringnav_audio_extension', '--undefined=start_mute', '--undefined=start_sleep', '--undefined=ringnav_genre_copy', '--undefined=ringnav_lyric_save', '--undefined=ringnav_lyric_drop', '--undefined=ringnav_cover_copy','--undefined=ringnav_folder_rm','--undefined=ringnav_bootmode', '--undefined=lockscreen_access','--undefined=ringnav_ts_read',
         '--undefined=ringnav_baidu_poll', '--undefined=ringnav_tidal_poll', '--undefined=addon_m3u_dir', f'--undefined={COVERINFO_CALL[2]}',
         '--undefined=coverflow_player_cover', '--undefined=coverflow_grid_cover', '--undefined=coverflow_album_cover', '--undefined=coverflow_folder_cover', '--undefined=headset_bt_init',
-        '--undefined=headset_status_register', '--undefined=headset_bt_autolink',
+        '--undefined=headset_status_register', '--undefined=headset_bt_autolink', '--undefined=ringnav_name_sort',
         *nav,out/'trampoline.o',*extra,'-o',out/'patch.elf')
     run('llvm-objcopy','-O','binary',out/'patch.elf',out/'patch.bin')
     return symbols(out/'patch.elf')
@@ -2033,6 +2038,8 @@ def build(zip_path, out, logo, dev=False, repo=REPO, aic_idle_wait=False, rotato
     for address in SORT_TRIMS:
         patch_word(patched, address, branch(0x04110000, address, syms['toolsTrimLeft']),
                    jal(ps['ringnav_sort_key']), 'sort without a leading article')
+    for address in NAME_SORT_CALLS:
+        patch_word(patched, address, 0x0320f809, jal(ps['ringnav_name_sort']), 'sort non-owning references or use stock fallback')
     for address, name in ALBUM_ART:
         patch_word(patched, address, 0x0320f809, jal(ps[name]), 'same-named albums apart in art')
     for row in ALBUM_ART_ROW:

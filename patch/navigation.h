@@ -151,6 +151,9 @@ typedef struct {
     void *pod_label[POD_COUNT];
     void *art_cf_win, *art_cf_list; /* the artist page given its Coverflow, the albums pending */
     void *art_cf_veil;              /* the artist page unseen until they show, and its anim_hint */
+    char *art_cf_scope; /* owned until the delayed artist Cover Flow open */
+    unsigned library_index_gen;
+    int library_indexed;
     char art_cf_hint[64];
     unsigned art_cf_timer;
     unsigned wake_at; /* Wake: Double press, the screen-off centre press a second one must follow */

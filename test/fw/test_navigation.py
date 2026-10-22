@@ -2455,7 +2455,7 @@ def test_content_query_passes_its_arg_and_sort(fw):
     assert query.seen == [(b'select 1', 9)] and fw.calls('stock_content_query_trampoline')[0][1][3] == 0x33
 
 
-@pytest.mark.parametrize('fill, runs', [(2047 - len(AA) - 1, True), (2047 - len(AA), False), (5000, False)])
+@pytest.mark.parametrize('fill, runs', [(2047 - len(AA), True), (4095 - len(AA) - 1, True), (4095 - len(AA), False), (5000, False)])
 def test_library_query_refuses_what_wont_fit(fw, fill, runs):
     query = Query(fw)
     sql = b'y' * fill + b' albumsonger'

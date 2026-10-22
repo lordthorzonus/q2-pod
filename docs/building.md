@@ -72,6 +72,8 @@ All three kernel-module experiments were on by default from 1.5.0 to 1.6.1 and w
 python3 test/peq.py                        # PEQ parser, storage, DSP, EQ page (both tabs), 3EQ filters, player, visualizer FFT and scrobble upload (host cc; player needs -m32 libs, upload libcrypto)
 python3 test/peq.py --captures /tmp/eq --font BUILD/default.ttf  # the same, plus the EQ page's Simple tab in both iPod themes as PNGs
 python3 test/coverflow.py                  # Coverflow art cache and depth renderer (host cc -m32, pthreads)
+python3 test/library_queries.py            # artist SQL, indexed plans and 40k-track VM-work regression (Python/SQLite only)
+python3 test/reference_sort.py BUILD        # shipped MIPS libcstl under qemu-mipsel: exact sort/ties, ownership, fallbacks, metadata
 python3 test/coverflow.py --captures /tmp/cf  # the same, plus the renderer's frames as PNGs
 python3 test/mp3.py                        # native Xing seek bounds, CRC and truncated headers; TXXX encodings
 python3 test/mp3_gapless.py                # gapless parser/PCM and generated LAME/FFmpeg comparisons (cc, lame, ffmpeg, pkg-config, libavcodec/libavutil/libmad development files)
