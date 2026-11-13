@@ -1,5 +1,22 @@
 <h1 align="center">Q2 Pod</h1>
 
+## Experimental performance fork
+
+This branch of [lordthorzonus/q2-pod](https://github.com/lordthorzonus/q2-pod/tree/perf/library-navigation)
+experiments with large-library speedups on top of [upstream Q2 Pod](https://github.com/DiamondBond/q2-pod):
+
+- Indexed artist lookups and artist-scoped album metadata queries instead of whole-library reads.
+- Bounded Artists, Albums and Genres caches for faster repeat opens.
+- Reused album grouping and bounded batches for the artist's **All albums** action.
+- Reference sorting with stock's comparators and ordering, reducing expensive song-record copies.
+
+Regression tests check ordering, ownership and fallbacks; device performance and stability still need testing.
+Keep a known-working firmware as a rollback. Implementation and test commands are in
+[internals](docs/internals.md) and [building](docs/building.md).
+
+The download links below and Network Update still point to upstream releases, not this branch;
+installing an upstream update replaces these experimental changes.
+
 <p align="center">
   <img src="assets/screenshots/screens.svg" alt="Home, the menu beside the playing album's cover, and Now Playing, the cover beside the title, artist and album over the progress bar: the Minimal theme fading to Classic and back" width="86%">
 </p>
