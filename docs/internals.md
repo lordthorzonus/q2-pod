@@ -278,10 +278,8 @@ Every name-sorted library list (artists, album artists, composers, genres, album
 
 `load_localclass_list` (`0x51357c`) runs the class's query into `tools_pdeq_directory`, `deque_assign`s it to `*p_deque_showlist`, clears the staging deque and returns `deque_size(*p_deque_showlist)`, which its callers take as the row count (Playlists, `0xf00b`, and Baidu's `0xff26` fill their own deque and return its size). For `0xf003`–`0xf006` the query is `getAllAlbum`, `getAllArtist` (`GetAllAlbumArtist` when `g_artist_type == 1`), `getAllComposer` or `getAllGenre`, and each appends an Unknown row (id -1) whenever the list has any rows (`getAllArtist` `0x508034`: type 4, the "Unknown Artist" string), even when every song carries the tag. `ringnav_localclass` runs stock, and when that class's last row has id -1 it runs the query the row's press would run (`class_query`, shared with the [Queue menu](#queue-menu): `getMusicBySonger(NULL)` and its kin, `where songer=""`). With no song it `deque_pop_back`s the row and returns one less. Whether a song exists is all it asks, so `ringnav_localclass` sets `library_first` around that call and `library_query` ends the scoped query with `limit 1`: stock puts one record in the staging deque, not every song without the tag, and SQLite stops at that song. ponytail: `songtable` has no index on the tags, so SQLite still scans it up to the first such song, and all of it when every song has the tag. The Queue menu's query on the same row (`qm_query`) still takes every song. The staging deque is cleared again, as stock leaves it. Coverflow builds its own album list and drops an empty Unknown card the same way (`drop_unknown`), but its query has no limit. A list with no rows at all (no card, an empty library): `empty_toast`, from a 0 ms timer so the page that loads it is up, closes that page (`album_page` or `localclass_page` on top with `g_class_type` the list's class) once the window manager has marked it opened (its `stage` property `WINDOW_STAGE_OPENED`, set after the open animation; the close path reads the same at `0x69d218`) with `window_manager_close_window_force`, polling every `EMPTY_POLL_MS` until then or until it stops being on top, then toasts "No albums", "No artists", "No composers" or "No genres" (`msginfo_dialog`, 2 s) over the Library list. Stock opened the black page, and an empty Albums grid's Return then did nothing until a restart, though Hold Return: Home's `back_to_home` left it; where its `window_close` went was not found, so no Return reaches that page now. A page that is no longer on top, or is another, keeps the toast alone.
 
-Library category Unknown probes now append `LIMIT 1` to the stock detail SQL and disable name
-sorting. They retain its projection, tag predicates and music-only filter, so at most one song
-record is built. A failed query does not prove absence and must not remove the Unknown row.
-Coverflow's separate `drop_unknown` path is unchanged.
+The Unknown probe also disables name sorting. A failed query does not prove absence and must
+not remove the Unknown row. Coverflow's separate `drop_unknown` path is unchanged.
 
 The full Artists loader also keeps one deep-copied sorted query result below the stock loader,
 preserving its title and showlist handling. The key includes database, rewritten SQL (including
@@ -302,10 +300,8 @@ bounded at 512 KiB.
 
 The three stock database-query sort calls are wrapped without substituting borrowed record
 strings or pre-normalizing titles: libcstl can invoke stock's owning `stSongInfo` copy callback
-(`0x5b3b1c`), which frees destination strings before allocating copies. V00Ji's temporary title
-arena violated that ownership contract and was withdrawn after an Artists reboot on hardware.
-The four comparator trim sites retain stock article handling; per-row key reuse remains disabled.
-The revised MIPS regression executes the real stock copy callback
+(`0x5c65ac`), which frees destination strings before allocating copies. The four comparator trim
+sites retain stock article handling. The MIPS regression executes the real stock copy callback
 with strict string-allocation tracking, rather than simulating record movement with memcpy.
 
 The replacement reference-sort path (lists of 64–65,000 rows, supported name comparators and a
