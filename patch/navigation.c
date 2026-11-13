@@ -199,10 +199,10 @@ static int library_query_body(int content, const char *db, const char *sql, void
         sql = aa;
     }
     const char *from = library_music && sql ? strstr(sql, " from songtable") : 0;
-    if (from) { /* library_first: the Unknown row's check, which one song answers */
+    if (from) {
         int n = tk_snprintf(filtered, sizeof filtered,
-                            "%.*s from (select * from songtable where %s)%s%s", (int)(from - sql),
-                            sql, MUSIC_WHERE, from + 15, library_first ? " limit 1" : "");
+                            "%.*s from (select * from songtable where %s)%s", (int)(from - sql),
+                            sql, MUSIC_WHERE, from + 15);
         if (n < 0 || (unsigned)n >= sizeof filtered) return -1;
         sql = filtered;
     }
@@ -233,10 +233,14 @@ static int library_query_body(int content, const char *db, const char *sql, void
     if (expanded) sql = expanded;
     int result;
     if (library_first && sql) {
-        /* Upstream adds LIMIT 1 before scope expansion. Do not append another LIMIT or sort. */
-        if (content == 2) result = stock_sorted_query_trampoline(db, sql, row, 1);
-        else result = content ? stock_content_query_trampoline(db, sql, row, arg, 0)
-                              : stock_dbquery_trampoline(db, sql, row, 0);
+        /* Share upstream's Unknown-probe flag, but apply its one LIMIT after scope expansion
+         * so both filtered and unfiltered probes remain bounded. Never sort that single row. */
+        char probe[4096];
+        int n = tk_snprintf(probe, sizeof probe, "%s limit 1", sql);
+        if (n < 0 || (unsigned)n >= sizeof probe) result = -1;
+        else if (content == 2) result = stock_sorted_query_trampoline(db, probe, row, 1);
+        else result = content ? stock_content_query_trampoline(db, probe, row, arg, 0)
+                              : stock_dbquery_trampoline(db, probe, row, 0);
     } else if (library_artists) result = artist_query_cached(content, db, sql, row, arg, sort);
     else result = content == 2 ? stock_sorted_query_trampoline(db, sql, row, (int)arg)
                   : content   ? stock_content_query_trampoline(db, sql, row, arg, sort)

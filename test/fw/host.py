@@ -25,7 +25,7 @@ import build as tools_build  # noqa: E402
 import peq as tools_peq  # noqa: E402
 import theme as tools_theme  # noqa: E402
 
-PURE = set('memset memcpy memcmp memmove strcmp strncmp strlen strcasecmp strncasecmp strrchr strstr strcasestr strdup '
+PURE = set('memset memcpy memcmp memmove strcmp strncmp strcasecmp strncasecmp strrchr strstr strcasestr strdup '
            'calloc realloc free snprintf __isoc99_sscanf qsort pow cos sin cosf sinf log sqrt atoi strtol'.split())
 SOURCES = [ROOT/'patch'/name for name in [*tools_build.NAVIGATION, *tools_peq.UI_SOURCES]]
 # GCC 14 makes these two errors anyway; the rest is the 64-bit build's noise (pointer <-> int casts of
@@ -94,9 +94,13 @@ def stubs_source(names, data):
             f'long (*fw_mock_tk_strcmp)({args});', f'long tk_strcmp({args}) {{',
             f'    long saved[] = {{ {call} }}; note("tk_strcmp", saved, fw_mock_tk_strcmp != 0);',
             f'    if (fw_mock_tk_strcmp) return fw_mock_tk_strcmp({call});',
-            '    return a0 && a1 ? strcmp((const char *)a0, (const char *)a1) : a0 != a1;', '}']
+            '    return a0 && a1 ? strcmp((const char *)a0, (const char *)a1) : a0 != a1;', '}',
+            # Default to real strlen. Record models may override the 64-bit phantom pointers
+            # caused by an 8-byte read spanning two stock 4-byte fields (conftest.py).
+            f'long (*fw_mock_fw_strlen)({args});', f'long fw_strlen({args}) {{',
+            f'    return fw_mock_fw_strlen ? fw_mock_fw_strlen({call}) : strlen((const char *)a0);', '}']
     for name in names:
-        if name in ('tk_snprintf', 'tk_strcmp'):
+        if name in ('tk_snprintf', 'tk_strcmp', 'fw_strlen'):
             continue
         ret = types.get(name, 'long')
         kind = ret if ret in FLOATS else 'long'

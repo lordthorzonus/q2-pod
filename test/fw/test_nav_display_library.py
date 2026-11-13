@@ -2113,6 +2113,7 @@ class Records:
 
     def __init__(self):
         self.maps, self.used, self.high = [], 0, iter(self.HIGHS)
+        self.empty_fields = []
         self.low = self.map(0, 1 << 20, 0x40)  # MAP_32BIT
 
     def map(self, at, size, flags):
@@ -2145,7 +2146,17 @@ class Records:
             C.c_uint64.from_address(r + o).value = self.string(value, low)
         for offset, value in ((O['REC_TYPE'], kind), (O['REC_ID'], id_), (O['REC_CUE_START'], cue), (O['REC_DISC'], disc)):
             C.c_int.from_address(r + offset).value = value
+        # A cache now measures all stock string fields. Reading an unset field with host P()
+        # otherwise takes half of its populated neighbour as a pointer. Album artist is excluded:
+        # split_row can set it later. These fields are null in the actual 32-bit stock record.
+        self.empty_fields.extend(r + o for o in range(O['REC_NAME'], O['REC_ALBUM_ARTIST'], 4) if o not in values)
         return r
+
+    def strlen(self, pointer, *_):
+        pointer &= (1 << 64) - 1  # host stubs pass machine words as signed long
+        if not pointer or any(C.c_void_p.from_address(at).value == pointer for at in self.empty_fields):
+            return 0
+        return len(C.string_at(pointer))
 
     def close(self):
         for p, size in self.maps:
@@ -2153,8 +2164,9 @@ class Records:
 
 
 @pytest.fixture
-def records():
+def records(fw):
     r = Records()
+    fw.mock('fw_strlen', r.strlen)
     yield r
     r.close()
 

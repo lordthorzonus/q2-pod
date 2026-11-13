@@ -5182,8 +5182,8 @@ class PreparedNameMachine(SortMachine,QueueMachine):
         self.live_strings=set()
         super().__init__(); self.preparations=0; self.sorted_keys=[]; self.forwarded=[]
         self.handlers[syms['algo_sort_if']]='prepared:sort'
-        self.word(0xa2638c,0x1000010); self.handlers[0x1000010]='prepared:free'
-        self.word(0xa26cc0-0xabc,0x1000014)
+        self.word(0xa3a270,0x1000010); self.handlers[0x1000010]='prepared:free'  # V1.36 free GOT
+        self.word(0xa3a0e8,0x1000014)  # V1.36 malloc GOT (copy's gp - 0x9f8)
         self.handlers.pop(0x5c65ac,None)  # execute owning assignment even when exposed as song_record_copy
     def string(self,s):
         p=super().string(s); self.live_strings.add(p); return p
@@ -5643,7 +5643,7 @@ class ArtistCacheMachine(QueueMachine):
     def __init__(self):
         super().__init__(); self.executed=0; self.result=2
         self.handlers.pop(syms['toolsQueryDbTable'],None)  # execute the patched wrapper, not Machine's DB stub
-        self.word(0xa2638c,0x1000010)
+        self.word(0xa3a270,0x1000010)
         self.mock('strdup@GLIBC_2.0','strstr@GLIBC_2.0','strncmp@GLIBC_2.0')
         self.handlers[0x1000010]='cache_free'
         self.word(payload_syms['library_artists'],1)
@@ -5722,19 +5722,19 @@ class LibraryQueryMachine(Machine):
         elif self.tramps[address]=='dbquery':
             assert self.text(a)=='/mnt/data/database.db'
             if not getattr(self,'real_callback',False):
-                assert (c,d)==(123,0 if self.get(payload_syms['library_probe']) or self.get(payload_syms['library_tracks_scope']) else 1)
+                assert (c,d)==(123,0 if self.get(payload_syms['library_first']) or self.get(payload_syms['library_tracks_scope']) else 1)
         self.results=self.db.execute(self.sql).fetchall()
         if self.tramps[address]=='content_query': raise QueryDone  # stock's row handling after it isn't emulated
         self.returns(len(self.results))
 lm=LibraryQueryMachine(); AA="ifnull(nullif(albumsonger,''),songer)"
 # Unknown probes retain stock predicates and music exclusions, but return at most one row.
-lm.word(payload_syms['library_probe'],1)
+lm.word(payload_syms['library_first'],1)
 for scoped in (0,1):
     lm.word(payload_syms['library_music'],scoped)
     query='select * from songtable where songer=""'
     lm.call(address=HOOKS['toolsQueryDbTable'][0],args=(lm.string('/mnt/data/database.db'),lm.string(query),123,1),gap=0)
     assert len(lm.results)==(0 if scoped else 1) and lm.sql.endswith(' limit 1')
-lm.word(payload_syms['library_probe'],0)
+lm.word(payload_syms['library_first'],0)
 # Batch queries reuse the complete stock song projection, scope by literal album names, and do
 # not name-sort before Coverflow applies disc/track order. Shared compilations remain complete.
 lm.word(payload_syms['library_music'],1)
@@ -5956,7 +5956,7 @@ class AlbumPrefetchMachine(ClassMachine):
         self.db.executescript(library_sql('LIBRARY_INDEX_SQL'))
         self.handlers.pop(syms['toolsQueryDbTable'],None)
         for name in ('getAllAlbum','album_row'): self.handlers.pop(syms[name],None)
-        self.word(0xa26cc0-0xabc,0x1000014)  # stock album_row's lazy-bound malloc
+        self.word(0xa3a0e8,0x1000014)  # V1.36 stock album_row's lazy-bound malloc
         self.mock('strstr@GLIBC_2.0','strncmp@GLIBC_2.0')
     def hook(self,u,address,size,unused):
         if address==0x1000014:

@@ -59,6 +59,7 @@ class Memory:
 
     def __init__(self):
         self.maps, self.n = [], 0
+        self.composer_fields = []
         self.low = libc.mmap(0, 0x10000, 3, 0x62, -1, 0)  # MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT
         assert self.low and self.low + 0x10000 <= 1 << 31
         self.maps.append((self.low, 0x10000))
@@ -80,10 +81,22 @@ class Memory:
         assert not strings, strings
         body = (C.c_char * self.SIZE).from_address(r)
         struct.pack_into('<10I', body, O['REC_NAME'], *words)
+        self.composer_fields.append((r + 0x20, words[7] << 32 | words[6]))
         for field, value in (('ID', id_), ('TYPE', kind), ('TRACK', track), ('DISC', disc), ('CUE_START', cue[0]),
                              ('CUE_END', cue[1])):
             struct.pack_into('<i', body, O['REC_' + field], value)
         return r
+
+    def strlen(self, pointer, *_):
+        pointer &= (1 << 64) - 1  # host stubs pass machine words as signed long
+        # split_row writes an 8-byte album-artist pointer into a 4-byte layout on this host.
+        # Its low half overwrites composer's high half; that modelled field is an empty string,
+        # not the phantom address P() now reads. The MIPS suites exercise the real 32-bit fields.
+        for at, original in self.composer_fields:
+            current = C.c_void_p.from_address(at).value
+            if pointer == current and current != original:
+                return len(C.string_at(original))
+        return len(C.string_at(pointer)) if pointer else 0
 
     def close(self):
         for at, size in self.maps:
@@ -303,6 +316,7 @@ class Q2:
             if name in fw.stubs:
                 fw.mock(name, self.hooks[name])
         model = {
+            'fw_strlen': memory.strlen,
             # the player (mcl and player_*)
             'stock_load_trampoline': self.load, 'stock_start_player_trampoline': self.start,
             'stock_next_trampoline': self.next_song, 'stock_prev_trampoline': self.prev_song,
